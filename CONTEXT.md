@@ -1,109 +1,117 @@
 # ClawDPO
 
-ClawDPO governs autonomous preference-optimization campaigns that turn observed model failures into evaluated candidate models. Its responsibility ends before production release or deployment.
+ClawDPO 负责把观察到的模型问题转化为偏好训练数据，并迭代出经过评测的候选模型；它的职责在生产发布之前结束。
 
-## Language
-
-**Accepted Candidate**:
-A candidate model that does not regress on Test Set factual correctness and that Codex judges clearly better than the Best Model under the shared Evaluation Specs. Ties and uncertain comparisons are not accepted, and acceptance never means deployment.
-_Avoid_: Released model, production model
-
-**Dataset Revision**:
-An immutable, archived version of the preference-training data used by one or more Training Iterations.
-_Avoid_: Latest data, current data folder
-
-**Asynchronous Preference Improvement**:
-The RL-like loop in which a Behavior Policy produces replies, external stages turn correctness and quality feedback into Preference Pairs, and DPO learns the next policy. It is preference-based policy improvement, not trajectory-level reinforcement learning.
-_Avoid_: Static offline DPO, full RL
+## 模型与迭代
 
 **Behavior Policy**:
-The exact model revision that generates a Rollout Set and scores the Policy Likelihood used for the next policy update. Every response also retains the model revision that originally produced its text.
-_Avoid_: Latest model, unspecified model
+本轮生成回复并为训练候选计算 Policy Likelihood 的确切模型版本。
+_Avoid_: 最新模型、未注明版本的模型
 
-**Policy Lag**:
-The revision distance between the policy that supplies a response's eligibility likelihood and the policy being updated from it. The first version requires zero scoring lag; a historical response may be reused only after the current Behavior Policy rescored it.
-_Avoid_: Stale likelihood, unscored historical response
-
-**Correctness Gate**:
-The fast automated first-pass check that applies the shared Evaluation Specs to factual correctness and disqualifying failures such as hallucination. Passing makes a reply eligible for Codex review; failing disqualifies it from ever being chosen.
-_Avoid_: Quality ranker, final pair selector
-
-**Response Quality**:
-The ordered judgment of how well an acceptable reply answers the prompt. Codex applies it when constructing Preference Pairs, while the Pairwise Quality Judge applies it when comparing a Candidate Model with the Best Model.
-_Avoid_: Correctness, machine-evaluation pass
-
-**Pairwise Quality Judge**:
-The fast automated comparator that applies the shared Evaluation Specs to decide which of two replies to the same Test Set prompt is better. It provides a first pass before the stronger Codex judgment and remains separate from the Correctness Gate.
-_Avoid_: Correctness evaluator, scalar reward
-
-**Evaluation Specs**:
-The two owner-provided Markdown files that define response-quality comparison and factual-error detection. Curl evaluators use them for fast screening and Codex receives the same files as context for stronger final judgment, so ClawDPO does not invent a second rubric.
-_Avoid_: Generated rubric, separate Codex criteria
+**Candidate Model**:
+一次 Training Iteration 产出的新模型，必须与 Best Model 完成比较后才能被接受。
+_Avoid_: 新 Best、上线模型
 
 **Best Model**:
-The strongest retained model revision. It is replaced only when a Candidate Model has no factual-correctness regression and Codex judges it clearly better on the same Test Set; ties and uncertainty preserve the existing Best Model.
-_Avoid_: Latest checkpoint, production model
+当前保留的最强模型版本；比较结果并列或不确定时继续保留它。
+_Avoid_: 最新 checkpoint、production model
 
-**Policy Likelihood**:
-The current Behavior Policy's raw token logprobs for a response. Mean token logprob is the operational ranking score within one prompt's Rollout Set, cumulative logprob is retained for audit, and historical replies are rescored under the current policy before reuse.
-_Avoid_: Quality score, correctness confidence
+**Accepted Candidate**:
+通过既定正确性与质量条件、可以替代 Best Model 的 Candidate Model；接受不代表发布。
+_Avoid_: Released model、production model
 
-**Practical Policy Support**:
-The replies that are empirically plausible under the current Behavior Policy's standard raw rollout, rather than every sequence with merely nonzero mathematical probability. Both sides of a Preference Pair must lie within this support; observing a reply once is evidence but does not automatically admit an isolated Extreme-Tail outlier.
-_Avoid_: Any syntactically possible reply, fabricated negative
+**Training Iteration**:
+从当前模型重新生成 Preference Pair、完成 DPO 训练并比较新旧模型的一次循环。
+_Avoid_: 自动晋级
 
-**Supported Tail**:
-The 5th-to-25th percentile of mean raw token logprob within one prompt's Rollout Set. A correct, high-quality reply from this region is a useful exploratory chosen because the current policy can reach it without producing it routinely.
-_Avoid_: Lowest possible likelihood, off-support answer
+**Asynchronous Preference Improvement**:
+Behavior Policy 生成回复、外部评测与 Codex 构造 Preference Pair、DPO 学习下一版策略的 RL-like 循环；它不是 trajectory-level RL。
+_Avoid_: 静态离线 DPO、完整 RL
 
-**Extreme Tail**:
-The bottom 5 percent of mean raw token logprob within one prompt's Rollout Set. Replies here are archived but are ineligible for the current Preference Pair.
-_Avoid_: Supported Tail, ideal chosen
+**Policy Lag**:
+提供候选准入 likelihood 的 policy 与当前待更新 policy 之间的版本距离。
+_Avoid_: Stale likelihood、未重评分的历史回复
 
-**Likelihood Distribution**:
-The distribution of mean raw token logprob across one prompt's complete 256-response Rollout Set. The top 25 percent is high likelihood, the 5th-to-25th percentile is the Supported Tail, the bottom 5 percent is the Extreme Tail, and the middle 50 percent is not prioritized.
-_Avoid_: Global probability threshold, cross-prompt ranking
+## 数据与历史
+
+**Prompt Pool**:
+持续积累、可由后续模型重新生成回复的新旧 prompt 集合；进入池子不代表每轮都会形成训练 pair。
+_Avoid_: 训练 pair、当前数据集
+
+**Rollout Set**:
+一个 Behavior Policy 在固定采样配置下为同一 prompt 生成的完整回复集合。
+_Avoid_: Candidate Slice、部分 rollout
 
 **Candidate Slice**:
-The bounded, deliberately varied subset selected from the current Rollout Set for Codex to inspect together with the complete Chosen History. It is a review budget for current responses, not a cap on historical context or a closed list of allowed Preference Pair patterns.
-_Avoid_: Full rollout dump, training pair
+从当前 Rollout Set 中挑给 Codex 精审的有限候选集合；它不包含完整 rollout，也不是最终训练 pair。
+_Avoid_: Full rollout dump、Preference Pair
 
-**Retrieval Quadrant**:
-One of the four indexing regions formed by Correctness Gate pass/fail and high/low Policy Likelihood. The regions help build a varied Candidate Slice; they do not define an exhaustive taxonomy of Preference Pairs, and historical provenance remains a tag rather than a fifth class.
-_Avoid_: Sample Class, pair type, training role
+**Chosen History**:
+同一 prompt 历史上所有曾被选为 chosen 的回复，并保留各自来源模型版本。
+_Avoid_: 只有最新 chosen、永久标准答案
+
+**Quality Frontier**:
+Chosen History 中当前质量最好的一条回复；它是比较基准，但不会覆盖其他历史 chosen。
+_Avoid_: Ground truth、永久 chosen
 
 **Preference Pair**:
-Any valuable ordering between two replies to the same prompt that Codex selects after reviewing the Candidate Slice and relevant history. Both replies must be within Practical Policy Support; the chosen must be clearly better and factually sound, while the rejected is normally a high-likelihood behavior worth suppressing. A chosen may come from the low-likelihood tail but never from outside current-policy support.
-_Avoid_: Two scored samples, correctness-gate output
+Codex 为同一 prompt 选择的一组 chosen/rejected 排序关系；chosen 必须事实可靠且明确更好，两端都必须属于当前模型的 Practical Policy Support。
+_Avoid_: 两条带分数的样本、Correctness Gate 输出
+
+**Dataset Revision**:
+一次训练实际使用并永久存档的不可变偏好数据版本。
+_Avoid_: latest.jsonl、不断覆盖的数据目录
+
+**Test Set**:
+每次训练后用于比较模型的固定评测集合；其失败可以指导检索独立训练数据，但测试样本本身不进入训练。
+_Avoid_: Training Set、一次性保密考试
+
+## 评测与采样信号
+
+**Evaluation Specs**:
+owner 提供的两份 Markdown 评测口径，分别定义回复质量比较和事实错误判断；快速评测与 Codex 共用它们。
+_Avoid_: ClawDPO 自创 rubric、另一套 Codex 标准
+
+**Correctness Gate**:
+针对幻觉、事实错误等底线问题的快速二元初筛；失败回复永远不能成为 chosen。
+_Avoid_: 质量排序器、最终 pair selector
+
+**Pairwise Quality Judge**:
+快速比较同一 prompt 下两条回复质量的初筛器，最终判断仍由 Codex 完成。
+_Avoid_: Correctness evaluator、scalar reward
+
+**Response Quality**:
+在事实可靠的前提下，一条回复把问题回答得多好的相对次序。
+_Avoid_: 正确性、机评通过率
+
+**Policy Likelihood**:
+当前 Behavior Policy 产生某条回复的相对可能性；它不代表回复质量或事实正确性。
+_Avoid_: Quality score、correctness confidence
+
+**Likelihood Distribution**:
+同一 prompt 的完整 Rollout Set 内，各回复 Policy Likelihood 形成的分布。
+_Avoid_: 全局概率阈值、跨 prompt 排序
+
+**Practical Policy Support**:
+当前 Behavior Policy 在标准 rollout 下实际有机会产生的回复范围，而不是所有数学上非零概率的序列。
+_Avoid_: 任意可构造回复、人工编造负样本
+
+**Supported Tail**:
+Likelihood Distribution 中较难出现但仍属于 Practical Policy Support 的低概率区域。
+_Avoid_: 最低概率回复、off-policy answer
+
+**Extreme Tail**:
+Likelihood Distribution 中稀有到不适合直接进入当前 Preference Pair 的极端区域。
+_Avoid_: Supported Tail、理想 chosen
+
+**Retrieval Quadrant**:
+由 Correctness Gate 结果与 Policy Likelihood 区域交叉形成的候选检索索引；它不是封闭的 pair 类型表。
+_Avoid_: Sample Class、training role
 
 **Absolute Reject**:
-A reply that fails the Correctness Gate and is therefore permanently disqualified from the chosen side. Being bad is not enough to make it training data: it must also lie within Practical Policy Support and form a valuable ordering with a better chosen.
+未通过 Correctness Gate、永久失去 chosen 资格的回复。
 _Avoid_: Relative Reject
 
 **Relative Reject**:
-A high-current-likelihood reply that passes the Correctness Gate but has lower Response Quality than the newly selected chosen reply. Any entry in Chosen History may become a Relative Reject after current-policy rescoring when a better reply is found.
-_Avoid_: Machine-evaluation failure, Absolute Reject
-
-**Chosen History**:
-Every reply previously selected as chosen for one prompt, retained with its originating model revision. The complete history is shown during pair construction after every entry is rescored under the current policy.
-_Avoid_: Only the latest chosen, permanent ground truth
-
-**Quality Frontier**:
-The highest-Response-Quality member of a prompt's Chosen History. It is the current quality benchmark but does not replace or hide the rest of the history.
-_Avoid_: Permanent chosen, ground truth answer
-
-**Prompt Pool**:
-The growing archive of new and historical prompts eligible for rollout by later model versions. Membership does not guarantee that a prompt contributes a Preference Pair to every Training Iteration.
-_Avoid_: Training pairs, current dataset
-
-**Rollout Set**:
-The complete 256 replies sampled from the current model for one prompt under a fixed sampling configuration. It is processed and archived in full before a Candidate Slice is shown to Codex.
-_Avoid_: Adaptive rollout, partial rollout
-
-**Test Set**:
-The fixed evaluation set used after every Training Iteration. Its failures may guide retrieval of separate training conversations, but its own conversations never enter a Dataset Revision.
-_Avoid_: Blind holdout, acceptance-only set
-
-**Training Iteration**:
-One cycle that regenerates Preference Pairs from the current model, runs DPO training, and compares the result against the current best model on the Test Set. A model becomes the next starting point only when it improves that comparison.
-_Avoid_: Automatic promotion
+事实可靠但质量被另一条回复明确超过、因而可作为 rejected 的高概率回复。
+_Avoid_: Correctness failure、Absolute Reject
