@@ -15,7 +15,11 @@ class CliTest(unittest.TestCase):
         self.assertIn("Run a ClawDPO training task.", result.stdout)
 
     def test_shell_entrypoints_parse(self) -> None:
-        for script in ("infra/cli/curl.sh", "infra/cli/database.sh"):
+        for script in (
+            "infra/cli/curl.sh",
+            "infra/cli/database.sh",
+            "infra/cli/dpo.sh",
+        ):
             result = subprocess.run(
                 ["sh", "-n", script],
                 capture_output=True,

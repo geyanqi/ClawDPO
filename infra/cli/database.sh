@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# 表名和查询字段固定，Codex 只提供 WHERE；
+# SQL 服务接收 text/plain，并返回 text/csv。
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
     echo "usage: $0 <where.sql>" >&2
     exit 2

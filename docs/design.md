@@ -166,12 +166,13 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 
 ## 10. 工具边界
 
-外部能力统一通过 `infra/cli/` 下的薄脚本调用。当前有两个入口：
+外部能力统一通过 `infra/cli/` 下的薄脚本调用。当前有三个入口：
 
 - `curl.sh <request.json>`：调用 OpenAI-compatible 评测模型。
 - `database.sh <where.sql>`：从固定数据表拉取对话。
+- `dpo.sh <dataset-path>`：使用固定 ms-swift recipe 启动 DPO 训练。
 
-后续 owner 提供的 vLLM rollout 和 DPO 训练脚本也直接放在这个目录，不再按数据库、评测、训练拆子目录。
+后续 owner 提供的 vLLM rollout 脚本也直接放在这个目录，不再按数据库、评测、训练拆子目录。
 
 ### 10.1 机器评测
 
@@ -204,6 +205,16 @@ from openai_log_proxy
 Codex 每次只写一个以 `WHERE` 开头、以分号结束的 SQL 文件，可以在其中使用时间条件和 PostgreSQL 正则。脚本拼接完整 SQL 后，以 `text/plain` POST 到 `DATABASE_API_URL`，要求服务返回 CSV；鉴权只通过 `DATABASE_API_KEY` 环境变量提供。
 
 仓库中的薄脚本不保存密钥。API key、数据库凭据和后端权限必须由运行环境隔离；如果脚本本身也必须不可读，再把 `infra/cli/` 替换成 executable-only mount。
+
+### 10.3 DPO 训练
+
+`dpo.sh` 基于 ms-swift 官方 full DPO recipe。每次调用只传本轮 Dataset Revision 的本地路径：
+
+```bash
+infra/cli/dpo.sh /path/to/dataset.jsonl
+```
+
+训练 recipe 固定保存在脚本内。`MODEL_PATH` 指定本轮起始模型，`OUTPUT_DIR` 指定模型输出目录；未设置时沿用官方示例的 Qwen 模型和 `output`。GPU 默认使用 4 卡，也可通过 `NPROC_PER_NODE` 与 `CUDA_VISIBLE_DEVICES` 覆盖。
 
 ## 11. 模型晋级规则
 

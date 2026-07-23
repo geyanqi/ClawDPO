@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# 请求文件包含完整的 OpenAI-compatible body 和模型参数；
+# endpoint 与密钥只从运行环境读取。
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
     echo "usage: $0 <request.json>" >&2
     exit 2
