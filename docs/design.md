@@ -166,41 +166,44 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 
 ## 10. 工具边界
 
-Codex 只通过固定工具访问外部能力。预期能力如下，名称与 JSON 字段在实现时以 owner 的真实脚本为准：
+外部能力统一通过 `infra/cli/` 下的薄脚本调用。当前有两个入口：
 
-- `fetch_conversations`
-- `sanitize_conversations`（可选）
-- `evaluate_correctness_curl1`
-- `compare_quality_curl2`
-- `rollout_vllm`
-- `score_response_likelihood`
-- `build_candidate_slice`
-- `archive_dataset`
-- `train_dpo`
-- `evaluate_test`
+- `curl.sh <request.json>`：调用 OpenAI-compatible 评测模型。
+- `database.sh <where.sql>`：从固定数据表拉取对话。
 
-### 10.1 `curl1` 与 `curl2` 的具体接口
+后续 owner 提供的 vLLM rollout 和 DPO 训练脚本也直接放在这个目录，不再按数据库、评测、训练拆子目录。
 
-`curl1` 和 `curl2` 都是调用评测模型的固定 CLI 命令。endpoint、header、鉴权等固定部分由 owner 提供；Codex 每次只准备一个请求文件，并通过 `-d @<request-file>` 交给命令，不在命令行里临时拼 prompt 或推理参数。
+### 10.1 机器评测
+
+事实性检测和回复质量比较共用同一个 `curl.sh`。`curl1`、`curl2` 只是流程中的两种逻辑用途，不是两份脚本。endpoint 和鉴权分别通过 `OPENAI_API_URL`、`OPENAI_API_KEY` 传入；Codex 每次只准备一个请求文件，脚本内部用 `-d @<request-file>` 提交。
 
 请求文件是一个完整的 OpenAI-compatible 请求体，至少承载以下内容：
 
 - 要调用的评测模型。
-- `messages`：包含对应的 Markdown 评测 prompt 和本次待评内容。
+- `messages`：包含 `prompt/md1.md` 或 `prompt/md2.md`，以及本次待评内容。
 - owner 要求的 vLLM/OpenAI-compatible 推理参数。
 
 两类请求的区别只在评测内容：
 
 | 调用 | request file 中的评测 prompt | 本次待评内容 | 目的 |
 |---|---|---|---|
-| `curl1 -d @factuality-request.json` | `md1` | 原始问题/session + 一条回复 | 判断是否存在事实性问题 |
-| `curl2 -d @quality-request.json` | `md2` | 原始问题/session + 两条候选回复 | 判断哪条回复更好 |
+| `infra/cli/curl.sh factuality-request.json` | `prompt/md1.md` | 原始问题/session + 一条回复 | 判断是否存在事实性问题 |
+| `infra/cli/curl.sh quality-request.json` | `prompt/md2.md` | 原始问题/session + 两条候选回复 | 判断哪条回复更好 |
 
-一份 request file 对应一次 OpenAI-compatible 模型请求。所谓“批量初筛”，是由脚本批量生成并提交这些文件，再汇总模型返回结果；`curl1/curl2` 本身不包含另一套判断标准。
+一份 request file 对应一次模型请求。批量初筛就是批量生成并提交这些文件，再汇总返回结果。
 
-数据库工具默认返回可直接处理的脱敏对话；如仍需额外处理，由 owner 提供独立脱敏工具。
+### 10.2 数据库
 
-如果要求 Codex 无法查看脚本源码、curl 内容和凭据，必须通过独立进程、容器或不同系统用户强制隔离，只暴露调用接口；prompt 中写“不要读取”不构成安全边界。
+`database.sh` 固定执行以下查询头：
+
+```sql
+select create_time, conversation_detail
+from openai_log_proxy
+```
+
+Codex 每次只写一个以 `WHERE` 开头、以分号结束的 SQL 文件，可以在其中使用时间条件和 PostgreSQL 正则。脚本拼接完整 SQL 后，以 `text/plain` POST 到 `DATABASE_API_URL`，要求服务返回 CSV；鉴权只通过 `DATABASE_API_KEY` 环境变量提供。
+
+仓库中的薄脚本不保存密钥。API key、数据库凭据和后端权限必须由运行环境隔离；如果脚本本身也必须不可读，再把 `infra/cli/` 替换成 executable-only mount。
 
 ## 11. 模型晋级规则
 

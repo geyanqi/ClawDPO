@@ -14,6 +14,15 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("Run a ClawDPO training task.", result.stdout)
 
+    def test_shell_entrypoints_parse(self) -> None:
+        for script in ("infra/cli/curl.sh", "infra/cli/database.sh"):
+            result = subprocess.run(
+                ["sh", "-n", script],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,6 @@
 status: accepted
 ---
 
-# Codex 只通过不透明的固定工具访问外部能力
+# Codex 通过固定薄 CLI 访问外部能力
 
-数据库读取、脱敏、机器评测、vLLM rollout 和训练启动都由 owner 提供固定输入格式的可调用工具；Codex 可以提交参数并读取规定输出，但不能读取脚本源码、curl 内容或凭据。该限制必须由独立进程、容器或操作系统权限实现，而不能只依赖 prompt 中的“不要读取”。
+数据库读取、机器评测、vLLM rollout 和训练启动都通过 `infra/cli/` 下的固定薄脚本调用；脚本本身可以进入仓库，但不得包含 API key、数据库凭据或其他秘密。Codex 只提供 request file 或 `WHERE` 文件，敏感信息与后端权限由环境变量和操作系统权限隔离；需要隐藏脚本实现时，再把该目录替换成 executable-only mount。

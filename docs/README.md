@@ -17,7 +17,7 @@ ClawDPO 的文档按职责分层，避免同一条规则在多个文件里重复
 | [0001](adr/0001-stop-before-production-release.md) | 自治边界在生产发布前停止 |
 | [0002](adr/0002-use-an-adaptive-test-set.md) | 只维护 train/test，并允许测试 badcase 指导后续检索 |
 | [0003](adr/0003-train-single-turn-replies-only.md) | v1 只训练单轮回复 |
-| [0004](adr/0004-use-opaque-tools-for-external-access.md) | Codex 只通过不透明固定工具访问外部能力 |
+| [0004](adr/0004-use-opaque-tools-for-external-access.md) | Codex 通过固定薄 CLI 访问外部能力 |
 | [0005](adr/0005-regenerate-pairs-from-the-current-model.md) | 每版模型都从 Prompt Pool 重新生成 pair |
 | [0006](adr/0006-use-dpo-as-an-rl-like-policy-learner.md) | 用 DPO 模拟异步 RL 风格的策略改进 |
 | [0007](adr/0007-separate-correctness-and-quality-evaluation.md) | 正确性门槛与回复质量评测分离 |
