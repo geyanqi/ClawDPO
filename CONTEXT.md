@@ -17,12 +17,12 @@ _Avoid_: 新 Best、上线模型
 _Avoid_: 最新 checkpoint、production model
 
 **Accepted Candidate**:
-通过既定正确性与质量条件、可以替代 Best Model 的 Candidate Model；接受不代表发布。
+通过 Test Set 机器评测的既定正确性与质量条件、可以替代 Best Model 的 Candidate Model；接受不代表发布。
 _Avoid_: Released model、production model
 
 **Training Iteration**:
 从当前模型重新生成 Preference Pair、完成 DPO 训练并比较新旧模型的一次循环。
-_Avoid_: 自动晋级
+_Avoid_: Production rollout
 
 **Asynchronous Preference Improvement**:
 Behavior Policy 生成回复、外部评测与 Codex 构造 Preference Pair、DPO 学习下一版策略的 RL-like 循环；它不是 trajectory-level RL。
@@ -77,7 +77,7 @@ _Avoid_: ClawDPO 自创 rubric、另一套 Codex 标准
 _Avoid_: 质量排序器、最终 pair selector
 
 **Pairwise Quality Judge**:
-按照 `md2` 快速比较同一 prompt 下两条回复好坏的初筛器，最终判断仍由 Codex 完成。
+按照 `md2` 比较同一 prompt 下两条回复好坏；训练 pair 由 Codex 终判，模型晋级直接汇总机评胜场。
 _Avoid_: Correctness evaluator、scalar reward
 
 **Response Quality**:

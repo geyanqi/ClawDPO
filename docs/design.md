@@ -1,6 +1,6 @@
 # ClawDPO v1 设计规范
 
-> 状态：架构已确认，尚未开始实现。本文件是 v1 行为的唯一权威规范；术语定义见 [CONTEXT.md](../CONTEXT.md)，设计原因见 [ADR](adr/)。
+> 状态：基础工具和单轮 workflow 已实现，模型晋级由 Test Set 机器评测自动决定。本文件是 v1 行为的唯一权威规范；术语定义见 [CONTEXT.md](../CONTEXT.md)，设计原因见 [ADR](adr/)。
 
 ## 1. 范围与硬边界
 
@@ -26,7 +26,10 @@
     → 冻结 Dataset Revision
     → DPO 训练 Candidate Model
     → Candidate Model 与 Best Model 在同一 Test Set 上比较
-    → 明确提升则替换 Best Model，否则保留旧 Best Model
+    → 机评提升则替换 Best Model，否则保留旧 Best Model
+    → Test badcase + 数据检索 prompt 生成 WHERE 正则
+    → 数据库拉取独立对话 + Test Set messages 序列排除
+    → 下一轮 Prompt Pool
 ```
 
 同一模型版本内，rollout、机器评测和候选筛选可以并行或异步执行；Dataset Revision 冻结后才允许启动训练。
@@ -54,8 +57,8 @@
 
 | 信号 | 回答的问题 | 负责人 |
 |---|---|---|
-| Correctness | 有没有幻觉、事实错误等底线问题 | `curl1` 按 `md1` 初筛；Codex 按同一 `md1` 兜底 |
-| Response Quality | 在事实可靠的前提下，哪条回复更好 | `curl2` 按 `md2` 初筛；Codex 按同一 `md2` 终判 |
+| Correctness | 有没有幻觉、事实错误等底线问题 | `curl1` 按 `md1` 评测；构造 pair 时由 Codex 兜底 |
+| Response Quality | 在事实可靠的前提下，哪条回复更好 | `curl2` 按 `md2` 比较；构造 pair 时由 Codex 终判 |
 | Policy Likelihood | 当前模型多容易生成这条回复 | vLLM raw logprob 与候选筛选脚本 |
 
 通过 Correctness Gate 只表示回复没有底线错误，不表示质量高。高 likelihood 也不代表正确或优质。
@@ -65,7 +68,7 @@ owner 提供两份唯一评测 prompt：
 - `md1`：事实性检测 prompt。输入原始问题/session 和一条待评回复，判断它是否出现幻觉、事实错误或其他事实性底线问题。
 - `md2`：回复好坏比较 prompt。输入相同问题/session 下的两条回复，判断哪条回复回答得更好。
 
-`curl1` 使用 `md1`，`curl2` 使用 `md2`；Codex 也把相同 Markdown 文件作为 context，做更强的最终判断。ClawDPO 不另外创建 rubric 或第三套评测服务。
+`curl1` 使用 `md1`，`curl2` 使用 `md2`。构造训练 pair 时，Codex 把相同 Markdown 文件作为 context 做更强判断；训练后的模型晋级只汇总 curl 机评结果，不再经过 Codex。ClawDPO 不另外创建 rubric 或第三套评测服务。
 
 ## 5. Rollout 与 likelihood
 
@@ -157,10 +160,11 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 9. 没有有效 pair 的 prompt 跳过本轮训练；其余数据冻结为新的 Dataset Revision。
 10. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model。
 11. Candidate Model 与 Best Model 在相同 Test Set prompt 上分别生成回复。
-12. `curl1` 按 `md1` 检查事实性，`curl2` 按 `md2` 成对比较回复质量；Codex 使用相同口径终判。
-13. Candidate 事实性底线不退步且 Codex 明确判断整体更好时，才替换 Best Model；并列、退步或不确定都保留旧 Best Model。
-14. 未达目标时，根据 Test Set badcase 编写 SQL 规则，从数据库检索相似但不同的训练数据，进入下一轮。
-15. 达到目标时输出模型与报告；达到 `max_iterations` 仍未达标时停止。
+12. `curl1` 按 `md1` 检查两版回复的事实性，`curl2` 按 `md2` 逐题比较回复质量。
+13. Candidate 的事实性失败数不高于 Best 且质量胜场高于 Best 时自动替换 Best；否则保留旧 Best。
+14. Codex 读取 Test Set 机评 badcase 和 `prompt/训练数据检索.md`，编写 PostgreSQL `WHERE` 正则。
+15. 数据库拉回相似对话后，workflow 删除包含完整 Test Set messages 序列的原始样本，只把其余独立数据交给下一轮 Prompt Pool。
+16. 达到目标时输出模型与报告；达到 `max_iterations` 仍未达标时停止。
 
 测试 badcase 只用于决定“去哪里找新的训练数据”，测试原始对话不能进入 Prompt Pool 或 Dataset Revision。
 
@@ -173,6 +177,9 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 - `infra/cli/dpo.sh <dataset-path>`：使用固定 ms-swift recipe 启动 DPO 训练。
 - `infra/inference/rollout.py`：为每条 messages 固定生成 256 条回复。
 - `infra/inference/rescore.py`：用当前 policy 重评分 Swift DPO pair。
+- `workflow/select_candidates.py`：完成事实性初筛与 16/8/8 Candidate Slice。
+- `workflow/build_pairs.py`：校验 Codex 选出的 pair 并冻结 Swift DPO 数据。
+- `workflow/run_iteration.py`：按阶段保存训练、机评晋级与 badcase 拉数产物。
 
 前三个脚本位于 `infra/cli/`；两个直接调用 vLLM Python API 的脚本位于 `infra/inference/`。
 
@@ -206,6 +213,8 @@ from openai_log_proxy
 
 Codex 每次只写一个以 `WHERE` 开头、以分号结束的 SQL 文件，可以在其中使用时间条件和 PostgreSQL 正则。脚本拼接完整 SQL 后，以 `text/plain` POST 到 `DATABASE_API_URL`，要求服务返回 CSV；鉴权只通过 `DATABASE_API_KEY` 环境变量提供。
 
+Codex 使用 `prompt/训练数据检索.md`，把 Test Set badcase 抽象成可复用的错误模式和检索正则，不能用完整测试原题做正向精确匹配。查询结果还必须经过 workflow 的 Test Set messages 序列排除；即使数据库记录在测试 prompt 后还带有原回复，也会被删除。prompt 约束和硬过滤共同保证测试原始样本不进入训练池。
+
 仓库中的薄脚本不保存密钥。API key、数据库凭据和后端权限必须由运行环境隔离；如果脚本本身也必须不可读，再把 `infra/cli/` 替换成 executable-only mount。
 
 ### 10.3 vLLM 推理
@@ -236,7 +245,40 @@ python infra/inference/rescore.py pairs.jsonl rescored.jsonl --model /path/to/mo
 
 脚本用模型 chat template 确定 response token 边界，通过 vLLM `prompt_logprobs` teacher-force 重算 chosen 和 rejected。模板追加的 EOT/EOS 不计入 response 分数，结果写入 `policy_likelihood`。两个脚本默认使用 8 卡 tensor parallel，且显式使用 `raw_logprobs`。
 
-### 10.4 DPO 训练
+### 10.4 一轮 workflow
+
+`run_iteration.py` 把一轮产物保存在独立目录，通过六个阶段运行：
+
+```bash
+python workflow/run_iteration.py rollout runs/iteration-001 prompts.jsonl --model /path/to/model
+python workflow/run_iteration.py select runs/iteration-001 --request-template factuality-request.json
+python workflow/run_iteration.py freeze runs/iteration-001 codex-draft-pairs.jsonl
+python workflow/run_iteration.py train runs/iteration-001
+python workflow/run_iteration.py evaluate runs/iteration-001 test-set.jsonl test-results.jsonl --best-model /path/to/best
+python workflow/run_iteration.py mine runs/iteration-001 badcase-where.sql
+```
+
+`select` 会把 256 条回复全部送入 `curl.sh`，完整结果写入 `evaluated-rollouts.jsonl`，只把 Supported Tail + pass 16 条、High + fail 8 条、High + pass 8 条写入 `candidate-packets.jsonl`。已有机评结果时可用 `--factuality factuality.jsonl` 重放，格式为：
+
+```json
+{"trace_id":"trace-1","sample_index":0,"pass":true,"reason":""}
+```
+
+历史 chosen 先通过 `infra/inference/rescore.py` 用当前 policy 重评分，再用 `select --history rescored-history.jsonl` 全量附加。Codex 读取 Candidate Packet、`prompt/事实性检测.md` 和 `prompt/回复竞对.md`，输出 Swift DPO 格式的 draft pair。`build_pairs.py` 校验上下文和候选来源，要求当前 rollout chosen 通过 Correctness Gate、rejected 位于 High Likelihood、两端都不在 Extreme Tail；历史 chosen 的事实性由 Codex 按相同 prompt 重新确认。脚本不代替 Codex 判断回复质量。
+
+`evaluate` 接收 curl1/curl2 汇总后的逐题机评：
+
+```json
+{"trace_id":"test-1","best_factuality_pass":true,"candidate_factuality_pass":true,"quality_winner":"candidate"}
+```
+
+`quality_winner` 只能是 `candidate`、`best`、`tie` 或 `uncertain`。结果必须恰好覆盖完整 Test Set。Candidate 事实性失败数不增加且质量胜场更高时，workflow 自动把它记为下一轮 Best，并把决定写入 `promotion.json`；该动作不发布模型。Candidate 出现事实性失败或没有赢下质量比较的题目会连同机评详情写入 `test-badcases.jsonl`，供数据检索 prompt 使用。
+
+`mine` 使用 Codex 读取 `test-badcases.jsonl` 并按 `prompt/训练数据检索.md` 写出的 `WHERE` 文件调用数据库，把原始返回存为 `database-response.csv`，再输出剔除 Test Set messages 序列后的 `mined-train.csv`。测试或复跑时可用 `--database-result result.csv` 跳过真实请求。排除数量记录在 `manifest.json`，测试原文只留在隔离的 Test Set 快照中，不写入训练文件。
+
+每轮目录中的 `manifest.json` 记录当前阶段；Dataset Revision 冻结后不允许再次执行 `freeze`。
+
+### 10.5 DPO 训练
 
 `dpo.sh` 基于 ms-swift 官方 full DPO recipe。每次调用只传本轮 Dataset Revision 的本地路径：
 
@@ -248,16 +290,15 @@ infra/cli/dpo.sh /path/to/dataset.jsonl
 
 ## 11. 模型晋级规则
 
-Candidate Model 和 Best Model 必须在完全相同的 Test Set 上生成回复。晋级不使用加权总分，必须同时满足：
+Candidate Model 和 Best Model 必须在完全相同的 Test Set 上生成回复，逐条结果必须完整且唯一。晋级完全由机器评测汇总，不经过 Codex，也不使用加权总分，必须同时满足：
 
-1. `curl1` 按 `md1` 初筛，且 Codex 按同一 `md1` 终判事实性底线没有退步。
-2. 在 `curl2` 按 `md2` 初筛的基础上，Codex 按同一 `md2` 明确判断 Candidate 整体更好。
+1. `curl1` 结果中，Candidate 的事实性失败数不高于 Best。
+2. `curl2` 结果中，Candidate 的质量胜场严格高于 Best；`tie` 和 `uncertain` 不计入任一方胜场。
 
-任一条件不满足、比较并列或 Codex 无法确定时，都保留原 Best Model。接受 Candidate 只改变下一轮的 Best Model，不代表生产发布。
+任一条件不满足都保留原 Best Model。接受 Candidate 只改变下一轮的 Best Model，不代表生产发布。
 
 ## 12. 后续 TODO
 
 以下问题已明确保留，但不阻塞 v1：
 
 1. **Prompt Pool 规模化调度**：实际达到何种规模后不再适合每轮全量 rollout，以及届时选择冷却、淘汰还是优先级调度。
-2. **工具适配格式**：开始实现每个工具时，先向 owner 索要真实脚本及其输入输出格式，再记录具体 JSON Schema 和调用示例；当前不预设字段。

@@ -5,7 +5,13 @@ import unittest
 
 class CliTest(unittest.TestCase):
     def test_python_entrypoints_show_help(self) -> None:
-        for script in ("infra/inference/rollout.py", "infra/inference/rescore.py"):
+        for script in (
+            "infra/inference/rollout.py",
+            "infra/inference/rescore.py",
+            "workflow/select_candidates.py",
+            "workflow/build_pairs.py",
+            "workflow/run_iteration.py",
+        ):
             result = subprocess.run(
                 [sys.executable, script, "--help"],
                 capture_output=True,
