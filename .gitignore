@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Owner tools and training-task state
+tools/*
+!tools/README.md
+tasks/*
+!tasks/README.md
