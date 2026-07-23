@@ -14,7 +14,7 @@
 
 ```text
 脱敏线上对话
-    → curl1 正确性初筛并定位 badcase
+    → curl1（md1）事实性初筛并定位 badcase
     → Codex 选择值得训练的 prompt
     → Prompt Pool 调度节点
          v1：全量直通
@@ -22,7 +22,7 @@
     → 当前 Behavior Policy 对每个 prompt rollout 256 条
     → Correctness Gate + likelihood 分区
     → Candidate Slice + 全部 Chosen History
-    → Codex 按 md1/md2 构造 Preference Pair
+    → Codex 按 md1 查事实、按 md2 比质量，构造 Preference Pair
     → 冻结 Dataset Revision
     → DPO 训练 Candidate Model
     → Candidate Model 与 Best Model 在同一 Test Set 上比较
@@ -54,18 +54,18 @@
 
 | 信号 | 回答的问题 | 负责人 |
 |---|---|---|
-| Correctness | 有没有幻觉、事实错误等底线问题 | `curl1` 按 `md2` 初筛；Codex 按同一 `md2` 兜底 |
-| Response Quality | 在事实可靠的前提下，哪条回复更好 | `curl2` 按 `md1` 初筛；Codex 按同一 `md1` 终判 |
+| Correctness | 有没有幻觉、事实错误等底线问题 | `curl1` 按 `md1` 初筛；Codex 按同一 `md1` 兜底 |
+| Response Quality | 在事实可靠的前提下，哪条回复更好 | `curl2` 按 `md2` 初筛；Codex 按同一 `md2` 终判 |
 | Policy Likelihood | 当前模型多容易生成这条回复 | vLLM raw logprob 与候选筛选脚本 |
 
 通过 Correctness Gate 只表示回复没有底线错误，不表示质量高。高 likelihood 也不代表正确或优质。
 
-owner 提供两份唯一评测口径：
+owner 提供两份唯一评测 prompt：
 
-- `md1`：判断两个回复哪个更好。
-- `md2`：判断回复是否存在幻觉或事实错误。
+- `md1`：事实性检测 prompt。输入原始问题/session 和一条待评回复，判断它是否出现幻觉、事实错误或其他事实性底线问题。
+- `md2`：回复好坏比较 prompt。输入相同问题/session 下的两条回复，判断哪条回复回答得更好。
 
-curl 脚本使用它们做快速初筛，Codex 使用相同文件做更强的最终判断。ClawDPO 不另外创建 rubric 或第三套评测服务。
+`curl1` 使用 `md1`，`curl2` 使用 `md2`；Codex 也把相同 Markdown 文件作为 context，做更强的最终判断。ClawDPO 不另外创建 rubric 或第三套评测服务。
 
 ## 5. Rollout 与 likelihood
 
@@ -110,7 +110,7 @@ Correctness pass/fail 与 High Likelihood/Supported Tail 共同形成四个 Retr
 
 某个候选区域不足时有多少取多少，不从 Middle 区补齐。当前 rollout 只做“移除空白后文本完全一致”的精确去重，不做语义去重。
 
-除最多 32 条当前回复外，同一 prompt 的全部 Chosen History 必须全部附带，不能截断。每条历史 chosen 都包含当前 Behavior Policy 的重评分结果和当前分位。Codex 还会收到完整 session、likelihood 分布摘要、`md1` 和 `md2`；其余 rollout 原文只存档，不进入上下文。
+除最多 32 条当前回复外，同一 prompt 的全部 Chosen History 必须全部附带，不能截断。每条历史 chosen 都包含当前 Behavior Policy 的重评分结果和当前分位。Codex 还会收到完整 session、likelihood 分布摘要、用于事实性检测的 `md1` 和用于质量比较的 `md2`；其余 rollout 原文只存档，不进入上下文。
 
 ## 7. Preference Pair 构造
 
@@ -120,8 +120,8 @@ Correctness pass/fail 与 High Likelihood/Supported Tail 共同形成四个 Retr
 
 1. chosen 与 rejected 来自同一 prompt/session。
 2. 两端都通过当前 policy 的可达性排除规则，不能位于 Extreme Tail。
-3. chosen 先通过 `curl1`，再由 Codex 按 `md2` 确认没有事实性问题。
-4. Codex 按 `md1` 明确判断 chosen 优于 rejected；拿不准就放弃该 pair。
+3. chosen 先通过 `curl1`，再由 Codex 按 `md1` 确认没有事实性问题。
+4. Codex 按 `md2` 明确判断 chosen 优于 rejected；拿不准就放弃该 pair。
 5. rejected 优先是当前 policy 高概率生成、确实值得压低的行为。
 6. 历史回复参与前必须由当前 Behavior Policy 重评分，不能沿用旧 likelihood。
 
@@ -153,11 +153,11 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 5. 固定 vLLM 脚本让当前 Behavior Policy 为每个 prompt rollout 256 条。
 6. Correctness Gate 检查全部回复；脚本计算并保存 raw likelihood 分布。
 7. 候选筛选脚本构造最多 32 条当前 Candidate Slice，并重评分全部 Chosen History。
-8. Codex 读取 session、分布摘要、Candidate Slice、Chosen History、`md1`、`md2`，构造有价值的 Preference Pair。
+8. Codex 读取 session、分布摘要、Candidate Slice、Chosen History、`md1`、`md2`，先按 `md1` 兜底事实性，再按 `md2` 构造有价值的 Preference Pair。
 9. 没有有效 pair 的 prompt 跳过本轮训练；其余数据冻结为新的 Dataset Revision。
 10. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model。
 11. Candidate Model 与 Best Model 在相同 Test Set prompt 上分别生成回复。
-12. `curl1` 按 `md2` 检查正确性，`curl2` 按 `md1` 成对比较质量；Codex 使用相同口径终判。
+12. `curl1` 按 `md1` 检查事实性，`curl2` 按 `md2` 成对比较回复质量；Codex 使用相同口径终判。
 13. Candidate 事实性底线不退步且 Codex 明确判断整体更好时，才替换 Best Model；并列、退步或不确定都保留旧 Best Model。
 14. 未达目标时，根据 Test Set badcase 编写 SQL 规则，从数据库检索相似但不同的训练数据，进入下一轮。
 15. 达到目标时输出模型与报告；达到 `max_iterations` 仍未达标时停止。
@@ -179,6 +179,25 @@ Codex 只通过固定工具访问外部能力。预期能力如下，名称与 J
 - `train_dpo`
 - `evaluate_test`
 
+### 10.1 `curl1` 与 `curl2` 的具体接口
+
+`curl1` 和 `curl2` 都是调用评测模型的固定 CLI 命令。endpoint、header、鉴权等固定部分由 owner 提供；Codex 每次只准备一个请求文件，并通过 `-d @<request-file>` 交给命令，不在命令行里临时拼 prompt 或推理参数。
+
+请求文件是一个完整的 OpenAI-compatible 请求体，至少承载以下内容：
+
+- 要调用的评测模型。
+- `messages`：包含对应的 Markdown 评测 prompt 和本次待评内容。
+- owner 要求的 vLLM/OpenAI-compatible 推理参数。
+
+两类请求的区别只在评测内容：
+
+| 调用 | request file 中的评测 prompt | 本次待评内容 | 目的 |
+|---|---|---|---|
+| `curl1 -d @factuality-request.json` | `md1` | 原始问题/session + 一条回复 | 判断是否存在事实性问题 |
+| `curl2 -d @quality-request.json` | `md2` | 原始问题/session + 两条候选回复 | 判断哪条回复更好 |
+
+一份 request file 对应一次 OpenAI-compatible 模型请求。所谓“批量初筛”，是由脚本批量生成并提交这些文件，再汇总模型返回结果；`curl1/curl2` 本身不包含另一套判断标准。
+
 数据库工具默认返回可直接处理的脱敏对话；如仍需额外处理，由 owner 提供独立脱敏工具。
 
 如果要求 Codex 无法查看脚本源码、curl 内容和凭据，必须通过独立进程、容器或不同系统用户强制隔离，只暴露调用接口；prompt 中写“不要读取”不构成安全边界。
@@ -187,8 +206,8 @@ Codex 只通过固定工具访问外部能力。预期能力如下，名称与 J
 
 Candidate Model 和 Best Model 必须在完全相同的 Test Set 上生成回复。晋级不使用加权总分，必须同时满足：
 
-1. `curl1` 初筛和 Codex 终判均表明事实性底线没有退步。
-2. 在 `curl2` 初筛基础上，Codex 按 `md1` 明确判断 Candidate 整体更好。
+1. `curl1` 按 `md1` 初筛，且 Codex 按同一 `md1` 终判事实性底线没有退步。
+2. 在 `curl2` 按 `md2` 初筛的基础上，Codex 按同一 `md2` 明确判断 Candidate 整体更好。
 
 任一条件不满足、比较并列或 Codex 无法确定时，都保留原 Best Model。接受 Candidate 只改变下一轮的 Best Model，不代表生产发布。
 

@@ -4,4 +4,4 @@ status: accepted
 
 # 分离正确性门槛与成对质量评测
 
-ClawDPO 只接受 owner 提供的两份评测口径：`md1` 判断两个回复哪个更好，`md2` 判断是否存在幻觉、事实错误等底线问题。`curl1` 按 `md2` 做快速正确性初筛，`curl2` 按 `md1` 做快速成对质量初筛；Codex 直接接收同样的 `md1` 和 `md2` 作为 context，依靠更强能力做最终判断。这同时用于构造 Preference Pair 和训练后的模型晋级：Candidate Model 的事实性底线不能退步，且 Codex 必须明确判断它在同一 Test Set 上整体优于 Best Model；并列或拿不准时保留旧 Best Model。正确性与回复质量仍是两个独立信号，但 curl 与 Codex 不各自发明一套 rubric；ClawDPO 也不新增第三个评测服务。
+ClawDPO 只接受 owner 提供的两份评测 prompt：`md1` 检测幻觉、事实错误等事实性问题，`md2` 判断同一问题下两条回复哪条更好。`curl1` 把包含 `md1` 的 OpenAI-compatible request file 通过 `-d @file` 发给评测模型，`curl2` 以同样方式提交包含 `md2` 的 request file；Codex 直接接收相同 Markdown 文件作为 context，依靠更强能力做最终判断。这同时用于构造 Preference Pair 和训练后的模型晋级：Candidate Model 的事实性底线不能退步，且 Codex 必须明确判断它在同一 Test Set 上整体优于 Best Model；并列或拿不准时保留旧 Best Model。正确性与回复质量仍是两个独立信号，curl 只是请求模型的传输方式，不定义另一套 rubric。

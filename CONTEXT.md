@@ -69,15 +69,15 @@ _Avoid_: Training Set、一次性保密考试
 ## 评测与采样信号
 
 **Evaluation Specs**:
-owner 提供的两份 Markdown 评测口径，分别定义回复质量比较和事实错误判断；快速评测与 Codex 共用它们。
+owner 提供的两份 Markdown 评测口径：`md1` 定义事实性检测，`md2` 定义回复好坏比较；快速评测与 Codex 共用它们。
 _Avoid_: ClawDPO 自创 rubric、另一套 Codex 标准
 
 **Correctness Gate**:
-针对幻觉、事实错误等底线问题的快速二元初筛；失败回复永远不能成为 chosen。
+按照 `md1` 检测幻觉、事实错误等底线问题的快速二元初筛；失败回复永远不能成为 chosen。
 _Avoid_: 质量排序器、最终 pair selector
 
 **Pairwise Quality Judge**:
-快速比较同一 prompt 下两条回复质量的初筛器，最终判断仍由 Codex 完成。
+按照 `md2` 快速比较同一 prompt 下两条回复好坏的初筛器，最终判断仍由 Codex 完成。
 _Avoid_: Correctness evaluator、scalar reward
 
 **Response Quality**:
