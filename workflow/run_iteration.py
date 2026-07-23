@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from run_report import write_report
+
 
 def load_manifest(directory: Path) -> dict:
     path = directory / "manifest.json"
@@ -21,6 +23,7 @@ def write_manifest(directory: Path, manifest: dict) -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    write_report(directory.parent)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -80,7 +83,10 @@ def main() -> None:
     evaluate.add_argument("directory", type=Path)
     evaluate.add_argument("test_set", type=Path)
     evaluate.add_argument("results", type=Path)
-    evaluate.add_argument("--best-model", required=True)
+
+    diagnose = stages.add_parser("diagnose")
+    diagnose.add_argument("directory", type=Path)
+    diagnose.add_argument("diagnosis", type=Path)
 
     mine = stages.add_parser("mine")
     mine.add_argument("directory", type=Path)
@@ -162,34 +168,68 @@ def main() -> None:
         draft = args.directory / "draft-pairs.jsonl"
         if args.draft_pairs.resolve() != draft.resolve():
             shutil.copy2(args.draft_pairs, draft)
+        dataset_revision = (args.directory / "dataset.jsonl").resolve()
         subprocess.run(
             [
                 sys.executable,
                 root / "workflow/build_pairs.py",
                 args.directory / "candidate-packets.jsonl",
                 draft,
-                args.directory / "dataset.jsonl",
+                dataset_revision,
             ],
             check=True,
         )
-        manifest["status"] = "frozen"
+        manifest.update(
+            {
+                "status": "frozen",
+                "dataset_revision": str(dataset_revision),
+            }
+        )
         write_manifest(args.directory, manifest)
         return
 
     if args.stage == "train":
         if manifest.get("status") not in {"frozen", "training"}:
             raise ValueError("train requires a frozen dataset")
-        manifest["status"] = "training"
+        candidate_model = (args.directory / "candidate-model").resolve()
+        training_log = (args.directory / "training.log").resolve()
+        manifest.update(
+            {
+                "status": "training",
+                "training_log": str(training_log),
+            }
+        )
         write_manifest(args.directory, manifest)
         environment = os.environ.copy()
         environment["MODEL_PATH"] = manifest["behavior_policy"]
-        environment["OUTPUT_DIR"] = str((args.directory / "candidate-model").resolve())
-        subprocess.run(
-            [root / "infra/cli/dpo.sh", args.directory / "dataset.jsonl"],
-            check=True,
-            env=environment,
+        environment["OUTPUT_DIR"] = str(candidate_model)
+        command = [root / "infra/cli/dpo.sh", args.directory / "dataset.jsonl"]
+        with training_log.open("w", encoding="utf-8") as destination:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=environment,
+            )
+            if process.stdout is None:
+                raise RuntimeError("failed to capture training output")
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                destination.write(line)
+                destination.flush()
+            return_code = process.wait()
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, command)
+        if not candidate_model.is_dir():
+            raise ValueError(f"{candidate_model}: training produced no model directory")
+        manifest.update(
+            {
+                "status": "trained",
+                "candidate_model": str(candidate_model),
+            }
         )
-        manifest["status"] = "trained"
         write_manifest(args.directory, manifest)
         return
 
@@ -227,6 +267,8 @@ def main() -> None:
             "ties": 0,
             "uncertain": 0,
         }
+        base_model = manifest["behavior_policy"]
+        candidate_model_name = str(candidate_model)
         result_rows = {}
         for row in read_jsonl(results_path):
             trace_id = row.get("trace_id")
@@ -234,6 +276,8 @@ def main() -> None:
             if (
                 not isinstance(trace_id, str)
                 or trace_id in result_rows
+                or row.get("best_model") != base_model
+                or row.get("candidate_model") != candidate_model_name
                 or not isinstance(row.get("best_factuality_pass"), bool)
                 or not isinstance(row.get("candidate_factuality_pass"), bool)
                 or winner not in {"candidate", "best", "tie", "uncertain"}
@@ -265,9 +309,9 @@ def main() -> None:
         )
         decision = {
             "promoted": promoted,
-            "previous_best_model": args.best_model,
+            "previous_best_model": base_model,
             "candidate_model": str(candidate_model),
-            "next_best_model": str(candidate_model) if promoted else args.best_model,
+            "next_best_model": str(candidate_model) if promoted else base_model,
             "summary": counts,
         }
         (args.directory / "promotion.json").write_text(
@@ -298,7 +342,7 @@ def main() -> None:
         manifest.update(
             {
                 "status": "accepted" if promoted else "rejected",
-                "previous_best_model": args.best_model,
+                "previous_best_model": base_model,
                 "candidate_model": str(candidate_model),
                 "next_best_model": decision["next_best_model"],
                 "evaluation_summary": counts,
@@ -306,6 +350,50 @@ def main() -> None:
         )
         write_manifest(args.directory, manifest)
         print(json.dumps(decision, ensure_ascii=False))
+        return
+
+    if args.stage == "diagnose":
+        if manifest.get("status") != "rejected":
+            raise ValueError("diagnose requires a rejected candidate")
+        if "diagnosis_summary" in manifest:
+            raise ValueError("training failure diagnosis is already recorded")
+        diagnosis = json.loads(args.diagnosis.read_text(encoding="utf-8"))
+        next_attempt = diagnosis.get("next_attempt", {})
+        expected_actions = {
+            "pipeline_bug": "fix_pipeline",
+            "data_problem": "rebuild_dataset",
+            "training_problem": "retry_training",
+            "insufficient_evidence": "collect_evidence",
+        }
+        if (
+            diagnosis.get("verdict") not in expected_actions
+            or not isinstance(diagnosis.get("summary"), str)
+            or not diagnosis["summary"].strip()
+            or any(
+                not isinstance(diagnosis.get(field), list)
+                or any(not isinstance(item, str) for item in diagnosis[field])
+                for field in ("evidence", "data_findings", "training_findings")
+            )
+            or not isinstance(next_attempt, dict)
+            or next_attempt.get("base_model") != manifest.get("behavior_policy")
+            or next_attempt.get("action")
+            != expected_actions.get(diagnosis.get("verdict"))
+            or not isinstance(next_attempt.get("single_change"), str)
+            or not next_attempt["single_change"].strip()
+        ):
+            raise ValueError("invalid training failure diagnosis")
+        destination = args.directory / "diagnosis.json"
+        if destination.exists() and args.diagnosis.resolve() != destination.resolve():
+            raise ValueError("diagnosis.json already exists")
+        if args.diagnosis.resolve() != destination.resolve():
+            shutil.copy2(args.diagnosis, destination)
+        manifest["diagnosis_summary"] = {
+            "verdict": diagnosis["verdict"],
+            "summary": diagnosis["summary"],
+            "next_action": next_attempt["action"],
+            "single_change": next_attempt["single_change"],
+        }
+        write_manifest(args.directory, manifest)
         return
 
     if manifest.get("status") not in {"accepted", "rejected"}:

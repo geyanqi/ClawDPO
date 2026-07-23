@@ -10,6 +10,8 @@ export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# 失败诊断后的单变量重试可以覆盖这四项；默认 recipe 不变。
+set -x
 exec swift rlhf \
     --rlhf_type dpo \
     --model "${MODEL_PATH:-Qwen/Qwen3-30B-A3B}" \
@@ -18,10 +20,10 @@ exec swift rlhf \
     --load_from_cache_file true \
     --split_dataset_ratio 0.01 \
     --torch_dtype bfloat16 \
-    --num_train_epochs 1 \
+    --num_train_epochs "${DPO_NUM_TRAIN_EPOCHS:-1}" \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
-    --learning_rate 1e-5 \
+    --learning_rate "${DPO_LEARNING_RATE:-1e-5}" \
     --gradient_accumulation_steps 2 \
     --eval_steps 100 \
     --save_steps 100 \
@@ -35,5 +37,6 @@ exec swift rlhf \
     --dataset_num_proc 8 \
     --deepspeed zero3 \
     --attn_impl flash_attn \
-    --rpo_alpha 0.1 \
+    --beta "${DPO_BETA:-0.1}" \
+    --rpo_alpha "${DPO_RPO_ALPHA:-0.1}" \
     --padding_free true

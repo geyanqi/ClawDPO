@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -141,10 +142,35 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(dataset["rejected_response"], rejected)
             manifest = json.loads((directory / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "frozen")
+            self.assertEqual(manifest["dataset_revision"], str(dataset_path.resolve()))
 
-            (directory / "candidate-model").mkdir()
-            manifest["status"] = "trained"
-            (directory / "manifest.json").write_text(json.dumps(manifest))
+            fake_bin = directory.parent / "bin"
+            fake_bin.mkdir()
+            fake_swift = fake_bin / "swift"
+            fake_swift.write_text(
+                "#!/bin/sh\n"
+                "echo \"{'loss': 0.5, 'grad_norm': 1.0, 'rewards/margins': 0.2}\"\n"
+                "mkdir -p \"$OUTPUT_DIR\"\n"
+            )
+            fake_swift.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "workflow/run_iteration.py",
+                    "train",
+                    directory,
+                ],
+                check=True,
+                env=environment,
+            )
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "trained")
+            self.assertEqual(
+                manifest["candidate_model"],
+                str((directory / "candidate-model").resolve()),
+            )
             test_set_path = directory / "external-test-set.jsonl"
             test_rows = [
                 {
@@ -170,18 +196,30 @@ class WorkflowTest(unittest.TestCase):
                     for row in (
                         {
                             "trace_id": "test-1",
+                            "best_model": "model-v1",
+                            "candidate_model": str(
+                                (directory / "candidate-model").resolve()
+                            ),
                             "best_factuality_pass": True,
                             "candidate_factuality_pass": True,
                             "quality_winner": "candidate",
                         },
                         {
                             "trace_id": "test-2",
+                            "best_model": "model-v1",
+                            "candidate_model": str(
+                                (directory / "candidate-model").resolve()
+                            ),
                             "best_factuality_pass": False,
                             "candidate_factuality_pass": True,
                             "quality_winner": "candidate",
                         },
                         {
                             "trace_id": "test-3",
+                            "best_model": "model-v1",
+                            "candidate_model": str(
+                                (directory / "candidate-model").resolve()
+                            ),
                             "best_factuality_pass": True,
                             "candidate_factuality_pass": True,
                             "quality_winner": "best",
@@ -197,14 +235,14 @@ class WorkflowTest(unittest.TestCase):
                     directory,
                     test_set_path,
                     results_path,
-                    "--best-model",
-                    "model-v0",
                 ],
                 check=True,
             )
             promotion = json.loads((directory / "promotion.json").read_text())
             self.assertTrue(promotion["promoted"])
+            self.assertEqual(promotion["previous_best_model"], "model-v1")
             self.assertEqual(promotion["summary"]["candidate_wins"], 2)
+            self.assertIn("rewards/margins", (directory / "training.log").read_text())
 
             where_path = directory / "where.sql"
             where_path.write_text(
@@ -264,6 +302,11 @@ class WorkflowTest(unittest.TestCase):
             manifest = json.loads((directory / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "accepted")
             self.assertEqual(manifest["mining_summary"]["excluded_test_rows"], 1)
+            report = (directory.parent / "report.md").read_text()
+            self.assertIn("## Training Triples", report)
+            self.assertIn(str(dataset_path.resolve()), report)
+            self.assertIn(str((directory / "candidate-model").resolve()), report)
+            self.assertIn("| iteration | accepted |", report)
 
 
 if __name__ == "__main__":

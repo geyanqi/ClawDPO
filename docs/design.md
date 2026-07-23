@@ -8,7 +8,8 @@
 - v1 只训练单轮回复：一条训练数据由同一 prompt/session 下的 chosen 和 rejected 构成。
 - 数据库读取、脱敏、机器评测、vLLM rollout 和训练均由 owner 提供固定工具；Codex 只调用接口。
 - 系统只维护 train/test。测试集可以被反复观察，但其原始样本永远不能进入训练数据。
-- 每个自动迭代任务必须提供正整数 `max_iterations`；缺失或非法时拒绝启动。
+- 每个自动迭代任务必须提供正整数 `max_iterations`；它限制 Training Iteration
+  总数，不限制单个 Base Stage 必须成功。缺失或非法时拒绝启动。
 
 ## 2. 总体架构
 
@@ -26,13 +27,30 @@
     → 冻结 Dataset Revision
     → DPO 训练 Candidate Model
     → Candidate Model 与 Best Model 在同一 Test Set 上比较
-    → 机评提升则替换 Best Model，否则保留旧 Best Model
+         通过：结束当前 Base Stage，Candidate 成为新 Base
+         未通过：保留原 Base，Codex 先诊断数据、再诊断训练动态
     → Test badcase + 数据检索 prompt 生成 WHERE 正则
     → 数据库拉取独立对话 + Test Set messages 序列排除
-    → 下一轮 Prompt Pool
+    → 下一次 Training Iteration
 ```
 
 同一模型版本内，rollout、机器评测和候选筛选可以并行或异步执行；Dataset Revision 冻结后才允许启动训练。
+
+ClawDPO 最重要的产出是多个不可变的 Training Triple：
+`(Behavior Policy / Base Model, Dataset Revision, Candidate Model Path)`。模型
+晋级只决定下一轮使用哪个 Behavior Policy，不影响本轮三元组的永久存档。多个
+Training Triple 串联成 Data Flywheel：模型生产自己的高质量数据，再由数据训练
+下一模型。
+
+一个 Base Stage 固定使用同一个 Best Model 作为 Base Model，可以连续产生多个
+Training Triple。只有某个 Candidate 通过晋级条件才算该 Base Stage 成功结束；
+失败 Candidate 留档并接受诊断，下一次 Training Iteration 仍从原 Base 开始。
+达到最大轮次、零 pair 或命令失败可以终止任务，但不能把未晋级的 Base Stage
+记录成成功。
+
+代码只实现可审计的单轮工具链，不支持中断恢复。多轮不再实现第二套 Python
+调度器；启动 Codex session 时发送 `prompt/迭代编排.md`，由该 session 根据
+`max_iterations` 持续调用单轮入口、读取中间产物并推进下一轮。
 
 ## 3. v1 固定参数
 
@@ -68,7 +86,11 @@ owner 提供两份唯一评测 prompt：
 - `md1`：事实性检测 prompt。输入原始问题/session 和一条待评回复，判断它是否出现幻觉、事实错误或其他事实性底线问题。
 - `md2`：回复好坏比较 prompt。输入相同问题/session 下的两条回复，判断哪条回复回答得更好。
 
-`curl1` 使用 `md1`，`curl2` 使用 `md2`。构造训练 pair 时，Codex 把相同 Markdown 文件作为 context 做更强判断；训练后的模型晋级只汇总 curl 机评结果，不再经过 Codex。ClawDPO 不另外创建 rubric 或第三套评测服务。
+`curl1` 使用 `md1`，`curl2` 使用 `md2`。构造训练 pair 时，Codex 使用唯一入口
+`prompt/codex/训练对构造.md`：一个 subagent 接收一个 prompt/session 的完整
+Candidate Packet，在组内同时复核事实性、比较回复质量并直接产出 Preference
+Pair。主线程每批并行处理 10 组。训练后的模型晋级只汇总 curl 机评结果，不再
+经过 Codex。
 
 ## 5. Rollout 与 likelihood
 
@@ -113,7 +135,10 @@ Correctness pass/fail 与 High Likelihood/Supported Tail 共同形成四个 Retr
 
 某个候选区域不足时有多少取多少，不从 Middle 区补齐。当前 rollout 只做“移除空白后文本完全一致”的精确去重，不做语义去重。
 
-除最多 32 条当前回复外，同一 prompt 的全部 Chosen History 必须全部附带，不能截断。每条历史 chosen 都包含当前 Behavior Policy 的重评分结果和当前分位。Codex 还会收到完整 session、likelihood 分布摘要、用于事实性检测的 `md1` 和用于质量比较的 `md2`；其余 rollout 原文只存档，不进入上下文。
+因此 256 只是上游 rollout 数量，不是 Codex 输入数量。Codex 不读取完整
+`evaluated-rollouts.jsonl`；likelihood 边际裁剪后，每组最多输入 32 条当前回复。
+
+除最多 32 条当前回复外，同一 prompt 的全部 Chosen History 必须全部附带，不能截断。每条历史 chosen 都包含当前 Behavior Policy 的重评分结果和当前分位。Codex 一次收到该组完整 session、likelihood 分布、全部机筛 responses 与 Chosen History，在同一个任务里完成事实性复核、质量比较和 pair 构造；其余 rollout 原文只存档，不进入上下文。
 
 ## 7. Preference Pair 构造
 
@@ -123,8 +148,8 @@ Correctness pass/fail 与 High Likelihood/Supported Tail 共同形成四个 Retr
 
 1. chosen 与 rejected 来自同一 prompt/session。
 2. 两端都通过当前 policy 的可达性排除规则，不能位于 Extreme Tail。
-3. chosen 先通过 `curl1`，再由 Codex 按 `md1` 确认没有事实性问题。
-4. Codex 按 `md2` 明确判断 chosen 优于 rejected；拿不准就放弃该 pair。
+3. chosen 先通过 `curl1`，再由 Codex 在单组任务中确认没有事实性问题。
+4. 同一个 Codex 任务必须明确判断 chosen 优于 rejected；拿不准就放弃该 pair。
 5. rejected 优先是当前 policy 高概率生成、确实值得压低的行为。
 6. 历史回复参与前必须由当前 Behavior Policy 重评分，不能沿用旧 likelihood。
 
@@ -146,6 +171,13 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 - 某个历史 prompt 本轮找不到有效的新 pair，就不进入本轮 Dataset Revision，但下轮仍会重新 rollout。
 - 每版 prompt、完整 rollout、Candidate Slice、Preference Pair、模型和评测结果都必须不可变存档，不能只覆盖 `latest.jsonl`。
 - Dataset Revision 冻结后才能训练，并必须记录它对应的 Behavior Policy 和 Training Iteration。
+- 每次完成训练都必须保存 Behavior Policy、Dataset Revision 路径和 Candidate
+  Model 路径组成的 Training Triple；Candidate 未晋级也不能删除该三元组。
+- 同一个 Base Stage 内的失败不会改变 Behavior Policy；下一次 Training
+  Iteration 仍从该 Base Model 生成数据并启动训练。
+- Candidate 或最终模型效果不好，不会使历史 Dataset Revision 失效。后续可以
+  回到可靠的 Base Model，按各数据的来源模型记录重新选择和组合 Dataset
+  Revision，再启动一次训练。
 
 ## 9. 一轮完整流程
 
@@ -156,15 +188,24 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 5. 固定 vLLM 脚本让当前 Behavior Policy 为每个 prompt rollout 256 条。
 6. Correctness Gate 检查全部回复；脚本计算并保存 raw likelihood 分布。
 7. 候选筛选脚本构造最多 32 条当前 Candidate Slice，并重评分全部 Chosen History。
-8. Codex 读取 session、分布摘要、Candidate Slice、Chosen History、`md1`、`md2`，先按 `md1` 兜底事实性，再按 `md2` 构造有价值的 Preference Pair。
+8. 每个 Codex subagent 读取一个完整 Candidate Packet，在同一次任务中复核
+   事实性、比较回复质量并构造 Preference Pair；主线程每批并行处理 10 组。
 9. 没有有效 pair 的 prompt 跳过本轮训练；其余数据冻结为新的 Dataset Revision。
-10. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model。
+   如果所有 prompt 都没有有效 pair，则立即结束整个循环，不训练、不评测、不拉
+   新数据。
+10. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model，并保存本轮
+    Training Triple。
 11. Candidate Model 与 Best Model 在相同 Test Set prompt 上分别生成回复。
 12. `curl1` 按 `md1` 检查两版回复的事实性，`curl2` 按 `md2` 逐题比较回复质量。
-13. Candidate 的事实性失败数不高于 Best 且质量胜场高于 Best 时自动替换 Best；否则保留旧 Best。
-14. Codex 读取 Test Set 机评 badcase 和 `prompt/训练数据检索.md`，编写 PostgreSQL `WHERE` 正则。
-15. 数据库拉回相似对话后，workflow 删除包含完整 Test Set messages 序列的原始样本，只把其余独立数据交给下一轮 Prompt Pool。
-16. 达到目标时输出模型与报告；达到 `max_iterations` 仍未达标时停止。
+13. Candidate 的事实性失败数不高于 Best 且质量胜场高于 Best 时自动替换 Best，
+    当前 Base Stage 成功结束。
+14. Candidate 未晋级时，Base 和 Candidate 分别重评分本轮 Dataset Revision；
+    固定脚本生成 Diagnosis Packet，Codex 先检查数据、再检查训练动态，并只规定
+    下一次尝试的一项改动。失败 Candidate 不能成为下一次训练起点。
+15. Codex 读取 Test Set 机评 badcase 和 `prompt/训练数据检索.md`，编写 PostgreSQL `WHERE` 正则。
+16. 数据库拉回相似对话后，workflow 删除包含完整 Test Set messages 序列的原始样本，只把其余独立数据交给下一轮 Prompt Pool。
+17. 晋级后以新 Best 开始下一个 Base Stage；未晋级时以原 Base 开始下一次
+    Training Iteration。达到 `max_iterations` 仍未达标时停止。
 
 测试 badcase 只用于决定“去哪里找新的训练数据”，测试原始对话不能进入 Prompt Pool 或 Dataset Revision。
 
@@ -179,9 +220,19 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 - `infra/inference/rescore.py`：用当前 policy 重评分 Swift DPO pair。
 - `workflow/select_candidates.py`：完成事实性初筛与 16/8/8 Candidate Slice。
 - `workflow/build_pairs.py`：校验 Codex 选出的 pair 并冻结 Swift DPO 数据。
+- `workflow/prepare_data.py`：汇总历史 chosen，并确定性地维护 Prompt Pool。
+- `workflow/evaluate_test.py`：生成两版 Test Set 回复并汇总 curl1/curl2 结果。
+- `workflow/build_diagnosis_packet.py`：汇总失败模型的 pair 重评分、Test badcase
+  和训练日志。
 - `workflow/run_iteration.py`：按阶段保存训练、机评晋级与 badcase 拉数产物。
+- `workflow/run_report.py`：持续生成跨轮运行报告。
+- `prompt/迭代编排.md`：Codex session 的多轮外层控制 prompt。
+- `prompt/codex/训练对构造.md`：按 prompt 组并行完成事实复核、质量比较和黄金
+  pair 构造。
+- `prompt/codex/训练失败诊断.md`：Candidate 未晋级后确定主因和下一次单一改动。
 
-前三个脚本位于 `infra/cli/`；两个直接调用 vLLM Python API 的脚本位于 `infra/inference/`。
+前三个脚本位于 `infra/cli/`；训练 rollout 与重评分脚本位于
+`infra/inference/`，`evaluate_test.py infer` 也直接调用 vLLM Python API。
 
 ### 10.1 机器评测
 
@@ -243,20 +294,24 @@ python infra/inference/rollout.py prompts.jsonl rollouts.jsonl --model /path/to/
 python infra/inference/rescore.py pairs.jsonl rescored.jsonl --model /path/to/model
 ```
 
-脚本用模型 chat template 确定 response token 边界，通过 vLLM `prompt_logprobs` teacher-force 重算 chosen 和 rejected。模板追加的 EOT/EOS 不计入 response 分数，结果写入 `policy_likelihood`。两个脚本默认使用 8 卡 tensor parallel，且显式使用 `raw_logprobs`。
+脚本用模型 chat template 确定 response token 边界，通过 vLLM `prompt_logprobs` teacher-force 重算 chosen 和 rejected。模板追加的 EOT/EOS 不计入 response 分数，结果写入 `policy_likelihood`。rollout 与重评分默认使用 8 卡 tensor parallel，且显式使用 `raw_logprobs`。
 
 ### 10.4 一轮 workflow
 
-`run_iteration.py` 把一轮产物保存在独立目录，通过六个阶段运行：
+`run_iteration.py` 把一次 Training Iteration 的产物保存在独立目录：
 
 ```bash
 python workflow/run_iteration.py rollout runs/iteration-001 prompts.jsonl --model /path/to/model
 python workflow/run_iteration.py select runs/iteration-001 --request-template factuality-request.json
 python workflow/run_iteration.py freeze runs/iteration-001 codex-draft-pairs.jsonl
 python workflow/run_iteration.py train runs/iteration-001
-python workflow/run_iteration.py evaluate runs/iteration-001 test-set.jsonl test-results.jsonl --best-model /path/to/best
+python workflow/run_iteration.py evaluate runs/iteration-001 test-set.jsonl test-results.jsonl
+python workflow/run_iteration.py diagnose runs/iteration-001 diagnosis.json
 python workflow/run_iteration.py mine runs/iteration-001 badcase-where.sql
 ```
+
+`diagnose` 只用于未晋级 Candidate；成功晋级时跳过。`evaluate` 总是把 manifest
+中的 Behavior Policy 当作 Base Model，不再接收第二个可能冲突的模型路径。
 
 `select` 会把 256 条回复全部送入 `curl.sh`，完整结果写入 `evaluated-rollouts.jsonl`，只把 Supported Tail + pass 16 条、High + fail 8 条、High + pass 8 条写入 `candidate-packets.jsonl`。已有机评结果时可用 `--factuality factuality.jsonl` 重放，格式为：
 
@@ -264,19 +319,75 @@ python workflow/run_iteration.py mine runs/iteration-001 badcase-where.sql
 {"trace_id":"trace-1","sample_index":0,"pass":true,"reason":""}
 ```
 
-历史 chosen 先通过 `infra/inference/rescore.py` 用当前 policy 重评分，再用 `select --history rescored-history.jsonl` 全量附加。Codex 读取 Candidate Packet、`prompt/事实性检测.md` 和 `prompt/回复竞对.md`，输出 Swift DPO 格式的 draft pair。`build_pairs.py` 校验上下文和候选来源，要求当前 rollout chosen 通过 Correctness Gate、rejected 位于 High Likelihood、两端都不在 Extreme Tail；历史 chosen 的事实性由 Codex 按相同 prompt 重新确认。脚本不代替 Codex 判断回复质量。
+历史 chosen 先通过 `infra/inference/rescore.py` 用当前 policy 重评分，再用
+`select --history rescored-history.jsonl` 全量附加。Codex 按
+`prompt/codex/训练对构造.md` 给每个 subagent 一条完整 Candidate Packet，由它
+同时复核事实性、比较候选质量并输出 Swift DPO draft pair。`build_pairs.py`
+校验上下文和候选来源，要求当前 rollout chosen 通过 Correctness Gate、rejected
+位于 High Likelihood、两端都不在 Extreme Tail；脚本不代替 Codex 判断回复质量。
+
+每轮开始前，固定命令准备历史和 Prompt Pool：
+
+```bash
+python workflow/prepare_data.py history runs runs/iteration-001/history-source.jsonl
+python infra/inference/rescore.py runs/iteration-001/history-source.jsonl runs/iteration-001/chosen-history.jsonl --model /path/to/current-best
+python workflow/prepare_data.py prompts next-prompts.jsonl --test-set test-set.jsonl --pool prompts.jsonl --mined previous/mined-train.csv
+```
+
+`history` 扫描全部历史 Dataset Revision，不截断 chosen；`prompts` 从数据库结果
+选择最后一个由 user 直接触发的 assistant turn，移除原回复和后续消息，并完成
+稳定 trace ID、精确去重和 Test Set 序列排除。历史文件为空时跳过重评分。
 
 `evaluate` 接收 curl1/curl2 汇总后的逐题机评：
 
 ```json
-{"trace_id":"test-1","best_factuality_pass":true,"candidate_factuality_pass":true,"quality_winner":"candidate"}
+{"trace_id":"test-1","best_model":"/path/to/base","candidate_model":"/path/to/candidate","best_factuality_pass":true,"candidate_factuality_pass":true,"quality_winner":"candidate"}
 ```
 
-`quality_winner` 只能是 `candidate`、`best`、`tie` 或 `uncertain`。结果必须恰好覆盖完整 Test Set。Candidate 事实性失败数不增加且质量胜场更高时，workflow 自动把它记为下一轮 Best，并把决定写入 `promotion.json`；该动作不发布模型。Candidate 出现事实性失败或没有赢下质量比较的题目会连同机评详情写入 `test-badcases.jsonl`，供数据检索 prompt 使用。
+`best_model` 和 `candidate_model` 必须分别与 manifest 的 Behavior Policy 和
+Candidate Model 完全一致；`quality_winner` 只能是 `candidate`、`best`、`tie`
+或 `uncertain`。结果必须恰好覆盖完整 Test Set。Candidate 事实性失败数不增加且
+质量胜场更高时，workflow 自动把它记为下一轮 Best，并把决定写入
+`promotion.json`；该动作不发布模型。Candidate 出现事实性失败或没有赢下质量
+比较的题目会连同机评详情写入 `test-badcases.jsonl`，供数据检索 prompt 使用。
+
+Test Set 回复和机评结果由固定命令生成：
+
+```bash
+python workflow/evaluate_test.py infer test-set.jsonl best-responses.jsonl --model /path/to/best
+python workflow/evaluate_test.py infer test-set.jsonl candidate-responses.jsonl --model /path/to/candidate
+python workflow/evaluate_test.py judge test-set.jsonl best-responses.jsonl candidate-responses.jsonl test-results.jsonl --factuality-template factuality-request.json --quality-template quality-request.json
+```
+
+`infer` 固定使用贪心解码和 seed 0，两版模型分进程加载；`judge` 为每条 Test Set
+样本执行两次事实性检测和一次质量比较，并保留两版回复及机评原因。
+
+Candidate 未晋级时，固定命令生成诊断证据：
+
+```bash
+python infra/inference/rescore.py runs/iteration-001/dataset.jsonl runs/iteration-001/base-pair-scores.jsonl --model /path/to/base
+python infra/inference/rescore.py runs/iteration-001/dataset.jsonl runs/iteration-001/candidate-pair-scores.jsonl --model /path/to/candidate
+python workflow/build_diagnosis_packet.py runs/iteration-001
+```
+
+Codex 按 `prompt/codex/训练失败诊断.md` 读取 packet 和其中列出的完整证据文件，
+把结论写成固定 JSON，再调用 `run_iteration.py diagnose`。该命令只保存结论并
+刷新报告，不改变机评结果或 Base Model。
 
 `mine` 使用 Codex 读取 `test-badcases.jsonl` 并按 `prompt/训练数据检索.md` 写出的 `WHERE` 文件调用数据库，把原始返回存为 `database-response.csv`，再输出剔除 Test Set messages 序列后的 `mined-train.csv`。测试或复跑时可用 `--database-result result.csv` 跳过真实请求。排除数量记录在 `manifest.json`，测试原文只留在隔离的 Test Set 快照中，不写入训练文件。
 
 每轮目录中的 `manifest.json` 记录当前阶段；Dataset Revision 冻结后不允许再次执行 `freeze`。
+每次 manifest 更新都会刷新 `<runs_dir>/report.md`，其中持续记录阶段、prompt
+数量、pair 数、跳过数量、机评、失败诊断、晋级结果和新拉数据量。报告顶部单独
+列出每轮的 Base Model、High-quality Dataset Revision 和 Trained Model Path；需要时可用
+`python workflow/run_report.py <runs_dir>` 重建。
+
+多轮执行不是另一个代码入口。Codex 以 `prompt/迭代编排.md` 作为 session
+启动消息，读取每轮 manifest 和 `promotion.json`：晋级时更新 Base Model，未
+晋级时保持 Base Model 并执行诊断，然后持续调用上述固定命令，直到达到目标或
+`max_iterations`。Codex 可以用 shell、
+`jq` 或短小临时脚本做一次性查看与筛选，但不应重复实现这些每轮都会运行的大型
+转换逻辑。
 
 ### 10.5 DPO 训练
 
@@ -286,7 +397,14 @@ python workflow/run_iteration.py mine runs/iteration-001 badcase-where.sql
 infra/cli/dpo.sh /path/to/dataset.jsonl
 ```
 
-训练 recipe 固定保存在脚本内。`MODEL_PATH` 指定本轮起始模型，默认是 `Qwen/Qwen3-30B-A3B`；`OUTPUT_DIR` 默认是 `output`。脚本默认使用 8 卡、单卡 batch size 1 和两步梯度累积，全局 batch size 为 16；GPU 列表仍可通过 `NPROC_PER_NODE` 与 `CUDA_VISIBLE_DEVICES` 覆盖。full DPO 还需要 reference model，实际能否装下取决于单卡显存，启动前必须在目标机器验证。
+训练 recipe 固定保存在脚本内。`MODEL_PATH` 指定本轮起始模型，默认是
+`Qwen/Qwen3-30B-A3B`；`OUTPUT_DIR` 默认是 `output`。脚本默认使用 8 卡、单卡
+batch size 1 和两步梯度累积，全局 batch size 为 16；GPU 列表仍可通过
+`NPROC_PER_NODE` 与 `CUDA_VISIBLE_DEVICES` 覆盖。训练输出同时写入
+`training.log`。失败诊断明确要求单变量重试时，才可覆盖
+`DPO_LEARNING_RATE`、`DPO_BETA`、`DPO_NUM_TRAIN_EPOCHS` 或
+`DPO_RPO_ALPHA`，一次只改一项。full DPO 还需要 reference model，实际能否装下
+取决于单卡显存，启动前必须在目标机器验证。
 
 ## 11. 模型晋级规则
 
@@ -296,6 +414,14 @@ Candidate Model 和 Best Model 必须在完全相同的 Test Set 上生成回复
 2. `curl2` 结果中，Candidate 的质量胜场严格高于 Best；`tie` 和 `uncertain` 不计入任一方胜场。
 
 任一条件不满足都保留原 Best Model。接受 Candidate 只改变下一轮的 Best Model，不代表生产发布。
+
+未晋级不是 Base Stage 的成功终点。Codex 必须先对本轮 Training Triple 生成
+Training Failure Diagnosis：存在直接工程错误时先修错误；否则优先检查 Dataset
+Revision 的 chosen 质量、排序强度和样本分布，再检查 DPO margin、chosen 绝对
+raw mean logprob、训练 loss、gradient norm 和 reward 指标。跨模型 raw
+likelihood margin 与训练器的 DPO reward margin 分开记录，不能互相替代。诊断
+只选择一个主因和下一次单一改动。新的 Training Iteration 继续使用原 Best
+Model，直到某个 Candidate 晋级或整个任务因最大轮次、零 pair 或命令错误停止。
 
 ## 12. 后续 TODO
 

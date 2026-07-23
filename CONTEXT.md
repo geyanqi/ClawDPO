@@ -5,7 +5,7 @@ ClawDPO 负责把观察到的模型问题转化为偏好训练数据，并迭代
 ## 模型与迭代
 
 **Behavior Policy**:
-本轮生成回复并为训练候选计算 Policy Likelihood 的确切模型版本。
+本轮生成回复、计算 Policy Likelihood 并作为 DPO 训练起点的确切模型版本；它也是 Training Triple 中的 Base Model。
 _Avoid_: 最新模型、未注明版本的模型
 
 **Candidate Model**:
@@ -21,8 +21,24 @@ _Avoid_: 最新 checkpoint、production model
 _Avoid_: Released model、production model
 
 **Training Iteration**:
-从当前模型重新生成 Preference Pair、完成 DPO 训练并比较新旧模型的一次循环。
+从固定 Base Model 重新生成 Preference Pair、完成一次 DPO 训练并比较新旧模型的一次尝试；失败后可以在同一个 Base Stage 内开始新的 Training Iteration。
 _Avoid_: Production rollout
+
+**Base Stage**:
+以同一个 Best Model 作为 Base Model 的连续训练阶段；只有某个 Candidate Model 通过 Test Set 晋级才算成功结束。失败的 Training Iteration 会被诊断和存档，但不会改变 Base Model。
+_Avoid_: 一次训练命令、失败即换 Base、无限重试
+
+**Training Triple**:
+一次 Training Iteration 永久关联的 Behavior Policy、Dataset Revision 和 Candidate Model；它是 ClawDPO 最重要的版本化产物。
+_Avoid_: 只有最终模型、只有最新数据集
+
+**Training Failure Diagnosis**:
+Candidate Model 未晋级后，对本轮 Training Triple 的失败原因分析；先排除明确的工程错误，再优先检查 Dataset Revision，最后检查训练动态，并为同一 Base Stage 的下一次 Training Iteration 提出一个可验证的单一改动。
+_Avoid_: Codex 改判机评、同时改多个变量、失败后直接更换 Base Model
+
+**Data Flywheel**:
+Training Triple 持续积累形成的迭代链；模型为自己生产高质量 Dataset Revision，训练后的模型再驱动后续数据生产。最终模型失败不会使已经保存的数据失效。
+_Avoid_: 固定数据集反复训练、只有 checkpoint 的模型迭代
 
 **Asynchronous Preference Improvement**:
 Behavior Policy 生成回复、外部评测与 Codex 构造 Preference Pair、DPO 学习下一版策略的 RL-like 循环；它不是 trajectory-level RL。
@@ -69,7 +85,7 @@ _Avoid_: Training Set、一次性保密考试
 ## 评测与采样信号
 
 **Evaluation Specs**:
-owner 提供的两份 Markdown 评测口径：`md1` 定义事实性检测，`md2` 定义回复好坏比较；快速评测与 Codex 共用它们。
+owner 提供的两份 Markdown 机器评测口径：`md1` 定义事实性检测，`md2` 定义回复好坏比较。Codex 通过一个训练对构造 prompt，在同一个候选组内同时复核这两个信号并产出 Preference Pair。
 _Avoid_: ClawDPO 自创 rubric、另一套 Codex 标准
 
 **Correctness Gate**:

@@ -10,6 +10,10 @@ class CliTest(unittest.TestCase):
             "infra/inference/rescore.py",
             "workflow/select_candidates.py",
             "workflow/build_pairs.py",
+            "workflow/prepare_data.py",
+            "workflow/evaluate_test.py",
+            "workflow/build_diagnosis_packet.py",
+            "workflow/run_report.py",
             "workflow/run_iteration.py",
         ):
             result = subprocess.run(
