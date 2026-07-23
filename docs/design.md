@@ -166,13 +166,15 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 
 ## 10. 工具边界
 
-外部能力统一通过 `infra/cli/` 下的薄脚本调用。当前有三个入口：
+外部能力通过薄脚本调用。当前入口包括：
 
-- `curl.sh <request.json>`：调用 OpenAI-compatible 评测模型。
-- `database.sh <where.sql>`：从固定数据表拉取对话。
-- `dpo.sh <dataset-path>`：使用固定 ms-swift recipe 启动 DPO 训练。
+- `infra/cli/curl.sh <request.json>`：调用 OpenAI-compatible 评测模型。
+- `infra/cli/database.sh <where.sql>`：从固定数据表拉取对话。
+- `infra/cli/dpo.sh <dataset-path>`：使用固定 ms-swift recipe 启动 DPO 训练。
+- `infra/inference/rollout.py`：为每条 messages 固定生成 256 条回复。
+- `infra/inference/rescore.py`：用当前 policy 重评分 Swift DPO pair。
 
-后续 owner 提供的 vLLM rollout 脚本也直接放在这个目录，不再按数据库、评测、训练拆子目录。
+前三个脚本位于 `infra/cli/`；两个直接调用 vLLM Python API 的脚本位于 `infra/inference/`。
 
 ### 10.1 机器评测
 
@@ -181,15 +183,15 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 请求文件是一个完整的 OpenAI-compatible 请求体，至少承载以下内容：
 
 - 要调用的评测模型。
-- `messages`：包含 `prompt/md1.md` 或 `prompt/md2.md`，以及本次待评内容。
+- `messages`：包含 `prompt/事实性检测.md` 或 `prompt/回复竞对.md`，以及本次待评内容。
 - owner 要求的 vLLM/OpenAI-compatible 推理参数。
 
 两类请求的区别只在评测内容：
 
 | 调用 | request file 中的评测 prompt | 本次待评内容 | 目的 |
 |---|---|---|---|
-| `infra/cli/curl.sh factuality-request.json` | `prompt/md1.md` | 原始问题/session + 一条回复 | 判断是否存在事实性问题 |
-| `infra/cli/curl.sh quality-request.json` | `prompt/md2.md` | 原始问题/session + 两条候选回复 | 判断哪条回复更好 |
+| `infra/cli/curl.sh factuality-request.json` | `prompt/事实性检测.md` | 原始问题/session + 一条回复 | 判断是否存在事实性问题 |
+| `infra/cli/curl.sh quality-request.json` | `prompt/回复竞对.md` | 原始问题/session + 两条候选回复 | 判断哪条回复更好 |
 
 一份 request file 对应一次模型请求。批量初筛就是批量生成并提交这些文件，再汇总返回结果。
 
@@ -206,7 +208,35 @@ Codex 每次只写一个以 `WHERE` 开头、以分号结束的 SQL 文件，可
 
 仓库中的薄脚本不保存密钥。API key、数据库凭据和后端权限必须由运行环境隔离；如果脚本本身也必须不可读，再把 `infra/cli/` 替换成 executable-only mount。
 
-### 10.3 DPO 训练
+### 10.3 vLLM 推理
+
+rollout 输入每行是一条待采样对话：
+
+```json
+{"trace_id":"trace-1","messages":[{"role":"user","content":"问题"}]}
+```
+
+以下命令为每条输入固定生成 256 条回复：
+
+```bash
+python infra/inference/rollout.py prompts.jsonl rollouts.jsonl --model /path/to/model
+```
+
+输出仍以 trace 为一行，`rollouts` 保存每条回复的文本、token IDs、逐 token raw logprob、累计 raw logprob、平均 raw token logprob、token 数和结束原因。采样固定使用 `temperature=1`、`top_p=1`、关闭 top-k 和所有额外 penalty。
+
+重评分输入直接采用 ms-swift DPO 格式，并额外保留 `trace_id`。chosen 是 `messages` 最后一条 assistant，rejected 位于 `rejected_response`：
+
+```json
+{"trace_id":"trace-1","messages":[{"role":"user","content":"问题"},{"role":"assistant","content":"chosen"}],"rejected_response":"rejected"}
+```
+
+```bash
+python infra/inference/rescore.py pairs.jsonl rescored.jsonl --model /path/to/model
+```
+
+脚本用模型 chat template 确定 response token 边界，通过 vLLM `prompt_logprobs` teacher-force 重算 chosen 和 rejected。模板追加的 EOT/EOS 不计入 response 分数，结果写入 `policy_likelihood`。两个脚本默认使用 8 卡 tensor parallel，且显式使用 `raw_logprobs`。
+
+### 10.4 DPO 训练
 
 `dpo.sh` 基于 ms-swift 官方 full DPO recipe。每次调用只传本轮 Dataset Revision 的本地路径：
 
@@ -214,7 +244,7 @@ Codex 每次只写一个以 `WHERE` 开头、以分号结束的 SQL 文件，可
 infra/cli/dpo.sh /path/to/dataset.jsonl
 ```
 
-训练 recipe 固定保存在脚本内。`MODEL_PATH` 指定本轮起始模型，`OUTPUT_DIR` 指定模型输出目录；未设置时沿用官方示例的 Qwen 模型和 `output`。GPU 默认使用 4 卡，也可通过 `NPROC_PER_NODE` 与 `CUDA_VISIBLE_DEVICES` 覆盖。
+训练 recipe 固定保存在脚本内。`MODEL_PATH` 指定本轮起始模型，默认是 `Qwen/Qwen3-30B-A3B`；`OUTPUT_DIR` 默认是 `output`。脚本默认使用 8 卡、单卡 batch size 1 和两步梯度累积，全局 batch size 为 16；GPU 列表仍可通过 `NPROC_PER_NODE` 与 `CUDA_VISIBLE_DEVICES` 覆盖。full DPO 还需要 reference model，实际能否装下取决于单卡显存，启动前必须在目标机器验证。
 
 ## 11. 模型晋级规则
 

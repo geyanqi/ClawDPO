@@ -17,11 +17,12 @@ ClawDPO 是一个由 Codex 编排的 DPO 迭代系统：它从脱敏业务对话
 - [架构决策](docs/adr/)：重要取舍及其原因。
 - [文档索引](docs/README.md)：文档职责和维护规则。
 
-当前状态：架构、代码架子、机评、数据库与 DPO 训练薄脚本已完成；vLLM rollout 脚本待接入。
+当前状态：架构、机评、数据库、vLLM rollout/重评分与 DPO 训练薄脚本已完成。
 
 ## 开发入口
 
 ```bash
-uv run python -m clawdpo --help
+python infra/inference/rollout.py --help
+python infra/inference/rescore.py --help
 uv run python -m unittest discover -s tests
 ```

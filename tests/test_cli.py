@@ -4,15 +4,14 @@ import unittest
 
 
 class CliTest(unittest.TestCase):
-    def test_help(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "-m", "clawdpo", "--help"],
-            capture_output=True,
-            text=True,
-        )
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("Run a ClawDPO training task.", result.stdout)
+    def test_python_entrypoints_show_help(self) -> None:
+        for script in ("infra/inference/rollout.py", "infra/inference/rescore.py"):
+            result = subprocess.run(
+                [sys.executable, script, "--help"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_shell_entrypoints_parse(self) -> None:
         for script in (
