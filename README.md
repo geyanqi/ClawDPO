@@ -55,6 +55,7 @@ flowchart TD
 ## 文档
 
 - [项目动机](docs/motivation.md)：为什么要做、希望解决什么问题。
+- [数据价值证据](docs/data-value.md)：为什么 rollout 和 Preference Pair 值得训练，以及如何保留可复核证据。
 - [设计规范](docs/design.md)：v1 的完整架构、数据筛选规则和运行流程；这是实现行为的唯一权威文档。
 - [领域术语](CONTEXT.md)：项目内统一使用的概念和名称。
 - [架构决策](docs/adr/)：重要取舍及其原因。

@@ -4,4 +4,20 @@ version = "0.1.0"
 description = "Codex-orchestrated DPO training loop"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "accelerate>=1.14.0",
+    "httpx[socks]>=0.28.1",
+    "pillow>=12.3.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "transformers>=5.14.1",
+    "vllm ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+]
+
+[tool.uv]
+override-dependencies = [
+    "torch==2.13.0; sys_platform == 'darwin'",
+]
+
+[tool.uv.sources]
+vllm = { git = "https://github.com/vllm-project/vllm.git", rev = "a454a1dd25a181334f6f126b2a2bec3d7c1d9aab" }
