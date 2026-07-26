@@ -1,6 +1,6 @@
 # ClawDPO
 
-ClawDPO 负责把观察到的模型问题转化为偏好训练数据，并迭代出经过评测的候选模型；它的职责在生产发布之前结束。
+ClawDPO 负责把观察到的模型问题转化为可验证、可复用的训练数据，并用受控训练和评测验收数据版本；它的职责在生产发布之前结束。
 
 ## 模型与迭代
 
@@ -78,6 +78,10 @@ _Avoid_: 两条带分数的样本、Correctness Gate 输出
 一次训练实际使用并永久存档的不可变偏好数据版本。
 _Avoid_: latest.jsonl、不断覆盖的数据目录
 
+**Promoted Dataset Revision**:
+在固定 Base Model、训练配置和 Test Set 下产出 Accepted Candidate 的 Dataset Revision；模型晋级是该数据版本通过当前验收的操作性标准。
+_Avoid_: 跨模型通用数据、单条样本的因果证明
+
 **Test Set**:
 每次训练后用于比较模型的固定评测集合；其失败可以指导检索独立训练数据，但测试样本本身不进入训练。
 _Avoid_: Training Set、一次性保密考试
@@ -85,7 +89,7 @@ _Avoid_: Training Set、一次性保密考试
 ## 评测与采样信号
 
 **Evaluation Specs**:
-owner 提供的两份 Markdown 机器评测口径：`md1` 定义事实性检测，`md2` 定义回复好坏比较。Codex 通过一个训练对构造 prompt，在同一个候选组内同时复核这两个信号并产出 Preference Pair。
+owner 提供的两份 Markdown 评测口径：`md1` 定义事实性检测，`md2` 定义回复好坏比较；机器评测负责规模化初筛和模型晋级，Codex 在精细数据判断中遵守同一口径。
 _Avoid_: ClawDPO 自创 rubric、另一套 Codex 标准
 
 **Correctness Gate**:
