@@ -1,6 +1,6 @@
 # ClawDPO
 
-ClawDPO 负责把观察到的模型问题转化为可验证、可复用的训练数据，并用受控训练和评测验收数据版本；它的职责在生产发布之前结束。
+ClawDPO 是一套自动数据飞轮：它把观察到的模型问题转化为贴近当前策略、可验证、可复用的训练数据，并用受控训练和评测验收数据版本；它的职责在生产发布之前结束。
 
 ## 模型与迭代
 
@@ -37,8 +37,12 @@ Candidate Model 未晋级后，对本轮 Training Triple 的失败原因分析�
 _Avoid_: Codex 改判机评、同时改多个变量、失败后直接更换 Base Model
 
 **Data Flywheel**:
-Training Triple 持续积累形成的迭代链；模型为自己生产高质量 Dataset Revision，训练后的模型再驱动后续数据生产。最终模型失败不会使已经保存的数据失效。
+从问题发现、当前策略采样、数据筛选、训练到验收自动循环形成的迭代链；晋级模型继续为自己生产下一版 Dataset Revision。
 _Avoid_: 固定数据集反复训练、只有 checkpoint 的模型迭代
+
+**Minimum-Disruption Alignment**:
+以当前 Behavior Policy 的实际生成分布为参照，只学习有证据支持的必要偏好差异，并用 Test Set 检查回归；目标是在保留其已有能力的基础上完成业务偏好对齐。
+_Avoid_: 脱离当前策略灌入答案、无约束改写模型分布、从头教授基模能力
 
 **Asynchronous Preference Improvement**:
 Behavior Policy 生成回复、外部评测与 Codex 构造 Preference Pair、DPO 学习下一版策略的 RL-like 循环；它不是 trajectory-level RL。

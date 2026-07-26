@@ -4,6 +4,8 @@
 
 ## 1. 范围与硬边界
 
+- 全流程遵守 Minimum-Disruption Alignment：从当前 Behavior Policy 采样，只训练
+  当前策略可达且偏好差异明确的数据，并用 Test Set 检查业务提升和能力回归。
 - ClawDPO 交付候选模型和评测报告，不负责发布、部署或修改线上模型别名。
 - v1 只训练单轮回复：一条训练数据由同一 prompt/session 下的 chosen 和 rejected 构成。
 - 数据库读取、脱敏、快速机器评测、vLLM rollout 和训练均由 owner 提供固定
@@ -44,7 +46,8 @@ ClawDPO 最重要的产出是多个不可变的 Training Triple：
 `(Behavior Policy / Base Model, Dataset Revision, Candidate Model Path)`。模型
 晋级只决定下一轮使用哪个 Behavior Policy，不影响本轮三元组的永久存档。多个
 Training Triple 串联成 Data Flywheel：模型生产自己的高质量数据，再由数据训练
-下一模型。
+下一模型。每一轮都以当轮 Behavior Policy 的生成分布为参照，避免把旧数据的
+训练价值不加检查地沿用到新 policy。
 
 一个 Base Stage 固定使用同一个 Best Model 作为 Base Model，可以连续产生多个
 Training Triple。只有某个 Candidate 通过晋级条件才算该 Base Stage 成功结束；
@@ -439,6 +442,11 @@ batch size 1 和两步梯度累积，全局 batch size 为 16；GPU 列表仍可
 `DPO_RPO_ALPHA`，一次只改一项。full DPO 还需要 reference model，实际能否装下
 取决于单卡显存，启动前必须在目标机器验证。
 
+本轮 Behavior Policy 必须同时作为 Candidate 的初始化模型和 DPO reference
+model。训练以 pair 的相对偏好为主，并由固定 beta 约束相对 reference 的更新；
+不得换用无关 reference 或绕开 Dataset Revision 直接对离线 chosen 做全量 SFT。
+这是 Minimum-Disruption Alignment 在训练阶段的约束。
+
 ### 10.6 高概率错误回复的 token 分叉验证
 
 token 分叉验证读取 `candidate-packets.jsonl` 中的 `high_fail` Absolute Reject，
@@ -532,6 +540,10 @@ Candidate Model 和 Best Model 必须在完全相同的 Test Set 上生成回复
 2. `curl2` 结果中，Candidate 的质量胜场严格高于 Best；`tie` 和 `uncertain` 不计入任一方胜场。
 
 任一条件不满足都保留原 Best Model。接受 Candidate 只改变下一轮的 Best Model，不代表生产发布。
+
+Test Set 必须同时覆盖目标业务偏好和项目要求保留的基模能力。上述晋级规则只能
+证明 Candidate 在该 Test Set 的覆盖范围内没有观察到能力回退，不能证明基模的
+全部能力都被完整保留。
 
 未晋级不是 Base Stage 的成功终点。Codex 必须先对本轮 Training Triple 生成
 Training Failure Diagnosis：存在直接工程错误时先修错误；否则优先检查 Dataset
