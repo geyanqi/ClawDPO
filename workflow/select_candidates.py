@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -39,31 +40,59 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers < 1:
         raise ValueError("workers must be positive")
+    root = Path(__file__).resolve().parents[1]
+    judge_prompt_path = root / "prompt/事实性检测.md"
+    judge_prompt = judge_prompt_path.read_text(encoding="utf-8")
+    judge_prompt_sha256 = hashlib.sha256(judge_prompt.encode()).hexdigest()
 
     rollout_rows = read_jsonl(args.rollouts)
     if not rollout_rows:
         raise ValueError("rollout input is empty")
     tasks = []
+    judge_inputs = {}
     seen_trace_ids = set()
     for row in rollout_rows:
         if (
             not isinstance(row.get("trace_id"), str)
+            or not row["trace_id"]
             or row["trace_id"] in seen_trace_ids
             or not isinstance(row.get("messages"), list)
+            or not isinstance(row.get("prompt_token_ids"), list)
+            or not row["prompt_token_ids"]
+            or any(type(token_id) is not int for token_id in row["prompt_token_ids"])
+            or not isinstance(row.get("engine"), dict)
+            or not isinstance(row.get("sampling"), dict)
             or not isinstance(row.get("rollouts"), list)
             or len(row["rollouts"]) != 256
         ):
-            raise ValueError("rollout rows need unique trace_id, messages, and 256 rollouts")
+            raise ValueError(
+                "rollout rows need unique trace_id, messages, prompt_token_ids, engine, sampling, and 256 rollouts"
+            )
         seen_trace_ids.add(row["trace_id"])
         seen_indices = set()
         for sample in row["rollouts"]:
             index = sample.get("sample_index") if isinstance(sample, dict) else None
             score = sample.get("raw_mean_token_logprob") if isinstance(sample, dict) else None
+            token_ids = sample.get("token_ids") if isinstance(sample, dict) else None
+            token_logprobs = (
+                sample.get("raw_token_logprobs") if isinstance(sample, dict) else None
+            )
             if (
                 not isinstance(sample, dict)
                 or not isinstance(index, int)
                 or index in seen_indices
                 or not isinstance(sample.get("response"), str)
+                or not isinstance(token_ids, list)
+                or not token_ids
+                or any(type(token_id) is not int for token_id in token_ids)
+                or not isinstance(token_logprobs, list)
+                or len(token_logprobs) != len(token_ids)
+                or any(
+                    isinstance(logprob, bool)
+                    or not isinstance(logprob, (int, float))
+                    or not math.isfinite(logprob)
+                    for logprob in token_logprobs
+                )
                 or not isinstance(score, (int, float))
                 or not math.isfinite(score)
                 or not isinstance(sample.get("raw_cumulative_logprob"), (int, float))
@@ -71,29 +100,65 @@ def main() -> None:
             ):
                 raise ValueError(f"{row['trace_id']}: invalid rollout sample")
             seen_indices.add(index)
+            judge_input = json.dumps(
+                {
+                    "messages": row["messages"],
+                    "response": sample["response"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            judge_inputs[(row["trace_id"], index)] = hashlib.sha256(
+                judge_input.encode()
+            ).hexdigest()
             tasks.append((row["trace_id"], row["messages"], sample))
 
     verdicts = {}
     if args.factuality:
+        replay_models = set()
         for verdict in read_jsonl(args.factuality):
             key = (verdict.get("trace_id"), verdict.get("sample_index"))
+            reason = verdict.get("reason", "")
+            judge_model = verdict.get("judge_model")
             if (
                 not isinstance(key[0], str)
-                or not isinstance(key[1], int)
+                or type(key[1]) is not int
                 or not isinstance(verdict.get("pass"), bool)
+                or not isinstance(reason, str)
+                or not isinstance(judge_model, str)
+                or not judge_model.strip()
+                or verdict.get("judge_input_sha256") != judge_inputs.get(key)
                 or key in verdicts
             ):
-                raise ValueError(f"{args.factuality}: invalid or duplicate factuality result")
+                raise ValueError(
+                    f"{args.factuality}: invalid, stale, or duplicate factuality result"
+                )
             verdicts[key] = {
                 "pass": verdict["pass"],
-                "reason": verdict.get("reason", ""),
+                "reason": reason,
             }
+            replay_models.add(judge_model.strip())
+        if len(replay_models) != 1:
+            raise ValueError(f"{args.factuality}: expected one judge_model")
+        correctness_gate = {
+            "source": "provided_factuality",
+            "model": replay_models.pop(),
+            "factuality": str(args.factuality.resolve()),
+            "factuality_sha256": hashlib.sha256(
+                args.factuality.read_bytes()
+            ).hexdigest(),
+            "judge_prompt": str(judge_prompt_path.resolve()),
+            "judge_prompt_sha256": judge_prompt_sha256,
+        }
     else:
-        root = Path(__file__).resolve().parents[1]
         request_template = json.loads(args.request_template.read_text(encoding="utf-8"))
-        if not isinstance(request_template, dict):
-            raise ValueError("request template must be a JSON object")
-        factuality_prompt = (root / "prompt/事实性检测.md").read_text(encoding="utf-8")
+        if (
+            not isinstance(request_template, dict)
+            or not isinstance(request_template.get("model"), str)
+            or not request_template["model"].strip()
+        ):
+            raise ValueError("request template must contain a non-empty model")
         curl = root / "infra/cli/curl.sh"
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -103,7 +168,7 @@ def main() -> None:
                 sequence, (trace_id, messages, sample) = task
                 request = dict(request_template)
                 request["messages"] = [
-                    {"role": "system", "content": factuality_prompt},
+                    {"role": "system", "content": judge_prompt},
                     {
                         "role": "user",
                         "content": json.dumps(
@@ -126,15 +191,30 @@ def main() -> None:
                     raise RuntimeError(completed.stderr or completed.stdout)
                 payload = json.loads(completed.stdout)
                 result = json.loads(payload["choices"][0]["message"]["content"])
-                if not isinstance(result.get("pass"), bool):
-                    raise ValueError("factuality judge did not return a boolean pass")
+                reason = result.get("reason", "") if isinstance(result, dict) else None
+                if (
+                    not isinstance(result, dict)
+                    or not isinstance(result.get("pass"), bool)
+                    or not isinstance(reason, str)
+                ):
+                    raise ValueError("factuality judge did not return pass and reason")
                 return (trace_id, sample["sample_index"]), {
                     "pass": result["pass"],
-                    "reason": result.get("reason", ""),
+                    "reason": reason,
                 }
 
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
                 verdicts = dict(pool.map(evaluate, enumerate(tasks)))
+        correctness_gate = {
+            "source": "machine_judge",
+            "model": request_template["model"],
+            "request_template": str(args.request_template.resolve()),
+            "request_template_sha256": hashlib.sha256(
+                args.request_template.read_bytes()
+            ).hexdigest(),
+            "judge_prompt": str(judge_prompt_path.resolve()),
+            "judge_prompt_sha256": judge_prompt_sha256,
+        }
 
     missing = [
         (trace_id, sample["sample_index"])
@@ -199,10 +279,14 @@ def main() -> None:
                 evaluated_sample["likelihood_region"] = region
                 evaluated_sample["correctness_pass"] = verdict["pass"]
                 evaluated_sample["correctness_reason"] = verdict["reason"]
+                evaluated_sample["judge_input_sha256"] = judge_inputs[
+                    (row["trace_id"], sample["sample_index"])
+                ]
                 evaluated_rollouts.append(evaluated_sample)
 
             evaluated_row = dict(row)
             evaluated_row["rollouts"] = evaluated_rollouts
+            evaluated_row["correctness_gate"] = correctness_gate
             evaluated_output.write(
                 json.dumps(evaluated_row, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
@@ -259,12 +343,15 @@ def main() -> None:
                             "candidate_kind": kind,
                             "sample_index": sample["sample_index"],
                             "response": sample["response"],
+                            "token_ids": sample["token_ids"],
+                            "raw_token_logprobs": sample["raw_token_logprobs"],
                             "raw_cumulative_logprob": sample["raw_cumulative_logprob"],
                             "raw_mean_token_logprob": sample["raw_mean_token_logprob"],
                             "num_tokens": sample["num_tokens"],
                             "likelihood_region": sample["likelihood_region"],
                             "correctness_pass": sample["correctness_pass"],
                             "correctness_reason": sample["correctness_reason"],
+                            "judge_input_sha256": sample["judge_input_sha256"],
                         }
                     )
 
@@ -302,6 +389,10 @@ def main() -> None:
                 "trace_id": row["trace_id"],
                 "messages": row["messages"],
                 "behavior_policy": row.get("behavior_policy"),
+                "prompt_token_ids": row["prompt_token_ids"],
+                "engine": row["engine"],
+                "sampling": row["sampling"],
+                "correctness_gate": correctness_gate,
                 "likelihood_distribution": {
                     "count": count,
                     "min": scores[0],

@@ -22,6 +22,7 @@ ClawDPO 的文档按职责分层，避免同一条规则在多个文件里重复
 | [0005](adr/0005-regenerate-pairs-from-the-current-model.md) | 每版模型都从 Prompt Pool 重新生成 pair |
 | [0006](adr/0006-use-dpo-as-an-rl-like-policy-learner.md) | 用 DPO 模拟异步 RL 风格的策略改进 |
 | [0007](adr/0007-separate-correctness-and-quality-evaluation.md) | 正确性门槛与回复质量评测分离 |
+| [0008](adr/0008-use-codex-as-critic-for-branch-validation.md) | 用带工具和上下文的 Codex 验证局部分叉 |
 
 ## 维护规则
 

@@ -96,6 +96,10 @@ _Avoid_: 质量排序器、最终 pair selector
 按照 `md2` 比较同一 prompt 下两条回复好坏；训练 pair 由 Codex 终判，模型晋级直接汇总机评胜场。
 _Avoid_: Correctness evaluator、scalar reward
 
+**Codex-as-Critic**:
+让带有项目上下文、评测口径和工具的 Codex 对 rollout 提供判断信号；它借用 actor–critic 的角色划分，但不是 PPO 的可训练 value model。
+_Avoid_: 裸模型调用、GPT API critic、PPO value network
+
 **Response Quality**:
 在事实可靠的前提下，一条回复把问题回答得多好的相对次序。
 _Avoid_: 正确性、机评通过率
@@ -131,3 +135,15 @@ _Avoid_: Relative Reject
 **Relative Reject**:
 事实可靠但质量被另一条回复明确超过、因而可作为 rejected 的高概率回复。
 _Avoid_: Correctness failure、Absolute Reject
+
+**Branch Point Candidate**:
+Codex-as-Critic 在高概率 Absolute Reject 中定位出的候选 token 位置；它只是语义线索，尚未证明该位置改变了最终结果。
+_Avoid_: 第一个错误 token、Verified Branch Point
+
+**Branch Trial**:
+从首次 rollout 保存的同一组 prompt token 和 response token prefix 出发，固定原分叉 token 或唯一替代 token 后生成的一条完整回复。
+_Avoid_: 原始 bad response、Preference Pair
+
+**Verified Branch Point**:
+两组固定 token 的 Branch Trial 达到样本量、事实性和严格通过率门槛，并由 Codex-as-Critic 明确判定替代组整体更好的 Branch Point Candidate；它不是统计显著性的代名词，也不是训练 pair。
+_Avoid_: 单次成功 rollout、chosen token、Preference Pair

@@ -23,12 +23,15 @@
 |---|---|
 | `trace_id`、`sample_index` | 找回它所属的 prompt 和原始 rollout |
 | `behavior_policy` | 明确是哪一版模型生成了它 |
-| `response`、`token_ids` | 保存回复原文和确切 token 序列 |
+| `prompt_token_ids`、`response`、`token_ids` | 保存实际送入 vLLM 的 prompt token 和回复 token，不靠事后重新分词 |
 | `raw_token_logprobs` | 保存每一步实际生成 token 的原始 logprob |
 | `raw_cumulative_logprob` | 审计整条回复的累计 logprob |
 | `raw_mean_token_logprob` | 衡量当前模型生成这条回复的相对难易 |
-| `num_tokens`、结束原因 | 解释长度差异和异常截断 |
-| Correctness Gate 结果 | 判断回复是否存在事实性底线问题 |
+| `num_tokens`、`finish_reason`、`stop_reason` | 解释长度差异、停止条件和异常截断 |
+| vLLM 版本、并行数、logprob 模式 | 记录生成数据时的推理环境 |
+| seed 和完整采样参数 | 说明这一批候选是在什么随机采样条件下生成的 |
+| Correctness Gate 结果及输入哈希 | 判断回复是否存在事实性底线问题，并防止旧判定误套到新回复 |
+| 评测模型、prompt 和 request template 哈希 | 记录实际使用的机器评测口径 |
 | prompt 内分位和 likelihood 区域 | 判断回复位于 High Likelihood、Supported Tail 还是 Extreme Tail |
 
 项目里所说的“平均 token 概率”，落盘时统一使用：
@@ -230,7 +233,48 @@ policy_likelihood_gap
 当这个值小于零时，表示当前模型平均而言更容易生成 rejected，而不是 chosen。
 这能直观说明训练方向的必要性，但它不是质量分，也不能跨 prompt 比较大小。
 
-### 4.4 训练后的整体验证
+### 4.4 高概率错误回复的局部分叉证据
+
+对 `high_fail` response 完成 token 分叉验证后，再汇总：
+
+```text
+Branch Localization Critic 能定位候选分叉点的 response 数
+完成两组 Branch Trial 的候选点数
+Verified Branch Point 数
+原 token 组与固定替代 token 组的事实性、任务完成和严格通过率
+严格通过率提升幅度、实际试验次数和质量胜负
+固定替代 token 及其原始 logprob
+```
+
+这部分证据说明：某条高概率错误回复不只是“整体不好”，而且能够找到一个具体
+生成位置；从首次 rollout 保存的同一组 prompt token 和 response prefix 重新
+生成时，只改变下一个 token 的选择，在多次试验中会改变 Codex-as-Critic 判断的
+实测通过率和回复质量。
+
+Branch Localization Critic 只负责提供语义位置，不能单独证明分叉点有效。原
+bad response 也不能直接算作原 token 组的一次失败，因为它本来就是按失败结果
+选入的。脚本先排除一次原 token、确定唯一替代 token，再分别固定两个 token
+重新 rollout。同一个 replica 的两条回复使用相同续写 seed。匿名的 Branch
+Outcome Critic 一次读取两组共 32 条回复，逐条判断事实性和任务完成情况，再判断
+哪一组整体更好。只有试验数、替代组严格通过率、提升幅度、事实性不退化，并且
+替代组被明确判为整体更好时，才能写入 Verified Branch Point。
+
+定位、生成和复评三段都保存内容绑定的 task ID、Codex prompt 与评测口径哈希、
+Codex 结果文件哈希、vLLM 版本和实际采样参数。finalize 会从原始输入重算 ID，
+不能只凭 `trace_id` 和序号套用旧结果。
+
+替代组保存的 `branch_token_raw_logprob` 是禁止原 token 之前，Behavior Policy
+对实际替代 token 给出的原始 logprob；它不是排除原 token 后重新归一化的条件
+概率。
+
+Codex-as-Critic 同时检查事实性、任务完成情况和整组质量，拒答、空泛或没有真正
+回答问题的回复不能只靠“没有事实错误”过关。Verified Branch Point 也不是 good
+token 或训练 pair，本文仍不讨论局部 SFT。
+第一版也不把“过早结束导致内容缺失”硬映射成 EOS 分叉；这类问题继续标记为
+不可局部定位。第一版的 16 次只是工程筛选下限，结论应写成“实测通过率达到
+门槛”，不能写成已经获得严格的统计显著性。
+
+### 4.5 训练后的整体验证
 
 如果该 Dataset Revision 已经完成训练，再附上：
 
@@ -254,7 +298,8 @@ ClawDPO 的数据价值不来自 rollout 数量本身，而来自一条完整证
 3. 正确性、回复质量和生成概率分别判断，互不代替；
 4. Preference Pair 两端来自同一 prompt，并且都处于当前模型实际会生成的范围；
 5. chosen/rejected 的排序理由和真正参与训练的原文都被永久保存；
-6. 每次 Training Triple 产出的 Candidate 都由固定且不直接进入训练的 Test Set
+6. 高概率错误回复可以额外生成经过多次反事实 rollout 验证的局部分叉证据；
+7. 每次 Training Triple 产出的 Candidate 都由固定且不直接进入训练的 Test Set
    判断是否提升。
 
 因此，这批数据不是静态收集的一堆“好答案”和“坏答案”，而是带有当前模型生成

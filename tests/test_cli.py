@@ -8,7 +8,10 @@ class CliTest(unittest.TestCase):
         for script in (
             "infra/inference/rollout.py",
             "infra/inference/rescore.py",
+            "infra/inference/branch_rollout.py",
             "workflow/select_candidates.py",
+            "workflow/locate_branch_points.py",
+            "workflow/evaluate_branch_points.py",
             "workflow/build_pairs.py",
             "workflow/prepare_data.py",
             "workflow/evaluate_test.py",

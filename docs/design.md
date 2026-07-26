@@ -6,7 +6,8 @@
 
 - ClawDPO 交付候选模型和评测报告，不负责发布、部署或修改线上模型别名。
 - v1 只训练单轮回复：一条训练数据由同一 prompt/session 下的 chosen 和 rejected 构成。
-- 数据库读取、脱敏、机器评测、vLLM rollout 和训练均由 owner 提供固定工具；Codex 只调用接口。
+- 数据库读取、脱敏、快速机器评测、vLLM rollout 和训练均由 owner 提供固定
+  工具；需要细查上下文和调用工具的局部分叉验证由 Codex-as-Critic 完成。
 - 系统只维护 train/test。测试集可以被反复观察，但其原始样本永远不能进入训练数据。
 - 每个自动迭代任务必须提供正整数 `max_iterations`；它限制 Training Iteration
   总数，不限制单个 Base Stage 必须成功。缺失或非法时拒绝启动。
@@ -23,6 +24,9 @@
     → 当前 Behavior Policy 对每个 prompt rollout 256 条
     → Correctness Gate + likelihood 分区
     → Candidate Slice + 全部 Chosen History
+    → Codex-as-Critic 定位 high_fail 的候选分叉
+    → 固定原 token 与唯一替代 token，各续写 16 次
+    → Codex-as-Critic 精评两组的事实性、任务完成情况和质量
     → Codex 按 md1 查事实、按 md2 比质量，构造 Preference Pair
     → 冻结 Dataset Revision
     → DPO 训练 Candidate Model
@@ -64,6 +68,7 @@ Training Triple。只有某个 Candidate 通过晋级条件才算该 Base Stage 
 | vLLM logprob 语义 | `raw_logprobs` |
 | likelihood 排名分数 | raw 平均 token logprob |
 | 单 prompt 当前候选上限 | 32 |
+| 每个分叉 token 的续写数 | 固定 16；两组共 32 条 |
 | Chosen History 上限 | 无，全部附带 |
 | `policy_lag` | `0`，历史回复必须由当前 policy 重评分 |
 | Prompt Pool 调度 | v1 每轮全量重跑 |
@@ -89,8 +94,9 @@ owner 提供两份唯一评测 prompt：
 `curl1` 使用 `md1`，`curl2` 使用 `md2`。构造训练 pair 时，Codex 使用唯一入口
 `prompt/codex/训练对构造.md`：一个 subagent 接收一个 prompt/session 的完整
 Candidate Packet，在组内同时复核事实性、比较回复质量并直接产出 Preference
-Pair。主线程每批并行处理 10 组。训练后的模型晋级只汇总 curl 机评结果，不再
-经过 Codex。
+Pair。外层编排持续拉满可用 subagent 槽位。训练后的模型晋级只汇总 curl 机评结果，不再
+经过 Codex。高概率错误回复的局部分叉验证链另外使用两次 Codex-as-Critic，但
+这些结果只证明数据价值，不参与 Candidate Model 的晋级判定。
 
 ## 5. Rollout 与 likelihood
 
@@ -188,23 +194,29 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 5. 固定 vLLM 脚本让当前 Behavior Policy 为每个 prompt rollout 256 条。
 6. Correctness Gate 检查全部回复；脚本计算并保存 raw likelihood 分布。
 7. 候选筛选脚本构造最多 32 条当前 Candidate Slice，并重评分全部 Chosen History。
-8. 每个 Codex subagent 读取一个完整 Candidate Packet，在同一次任务中复核
-   事实性、比较回复质量并构造 Preference Pair；主线程每批并行处理 10 组。
-9. 没有有效 pair 的 prompt 跳过本轮训练；其余数据冻结为新的 Dataset Revision。
+8. Branch Localization Critic 为每条 `high_fail` 定位最早语义分叉；脚本校验
+   原文字符范围，并用 Behavior Policy tokenizer 映射到原 response token。
+9. 对每个可定位点固定原 token 和唯一替代 token，各续写 16 次；一个 Branch
+   Outcome Critic 同时读取两组共 32 条匿名回复，逐条判断事实性和任务完成情况，
+   再判断哪一组整体质量更好。
+10. 每个 Codex subagent 读取一个完整 Candidate Packet，在同一次任务中复核
+   事实性、比较回复质量并构造 Preference Pair；外层编排持续拉满可用 subagent
+   槽位，但不会拆分一个 prompt 组。
+11. 没有有效 pair 的 prompt 跳过本轮训练；其余数据冻结为新的 Dataset Revision。
    如果所有 prompt 都没有有效 pair，则立即结束整个循环，不训练、不评测、不拉
    新数据。
-10. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model，并保存本轮
+12. Codex 调用固定命令启动 DPO 训练，得到 Candidate Model，并保存本轮
     Training Triple。
-11. Candidate Model 与 Best Model 在相同 Test Set prompt 上分别生成回复。
-12. `curl1` 按 `md1` 检查两版回复的事实性，`curl2` 按 `md2` 逐题比较回复质量。
-13. Candidate 的事实性失败数不高于 Best 且质量胜场高于 Best 时自动替换 Best，
+13. Candidate Model 与 Best Model 在相同 Test Set prompt 上分别生成回复。
+14. `curl1` 按 `md1` 检查两版回复的事实性，`curl2` 按 `md2` 逐题比较回复质量。
+15. Candidate 的事实性失败数不高于 Best 且质量胜场高于 Best 时自动替换 Best，
     当前 Base Stage 成功结束。
-14. Candidate 未晋级时，Base 和 Candidate 分别重评分本轮 Dataset Revision；
+16. Candidate 未晋级时，Base 和 Candidate 分别重评分本轮 Dataset Revision；
     固定脚本生成 Diagnosis Packet，Codex 先检查数据、再检查训练动态，并只规定
     下一次尝试的一项改动。失败 Candidate 不能成为下一次训练起点。
-15. Codex 读取 Test Set 机评 badcase 和 `prompt/训练数据检索.md`，编写 PostgreSQL `WHERE` 正则。
-16. 数据库拉回相似对话后，workflow 删除包含完整 Test Set messages 序列的原始样本，只把其余独立数据交给下一轮 Prompt Pool。
-17. 晋级后以新 Best 开始下一个 Base Stage；未晋级时以原 Base 开始下一次
+17. Codex 读取 Test Set 机评 badcase 和 `prompt/训练数据检索.md`，编写 PostgreSQL `WHERE` 正则。
+18. 数据库拉回相似对话后，workflow 删除包含完整 Test Set messages 序列的原始样本，只把其余独立数据交给下一轮 Prompt Pool。
+19. 晋级后以新 Best 开始下一个 Base Stage；未晋级时以原 Base 开始下一次
     Training Iteration。达到 `max_iterations` 仍未达标时停止。
 
 测试 badcase 只用于决定“去哪里找新的训练数据”，测试原始对话不能进入 Prompt Pool 或 Dataset Revision。
@@ -218,7 +230,13 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 - `infra/cli/dpo.sh <dataset-path>`：使用固定 ms-swift recipe 启动 DPO 训练。
 - `infra/inference/rollout.py`：为每条 messages 固定生成 256 条回复。
 - `infra/inference/rescore.py`：用当前 policy 重评分 Swift DPO pair。
+- `infra/inference/branch_rollout.py`：从同一个 token prefix 重新生成
+  Branch Trial。
 - `workflow/select_candidates.py`：完成事实性初筛与 16/8/8 Candidate Slice。
+- `workflow/locate_branch_points.py`：生成 Branch Localization Critic 任务，
+  校验 Codex 结果并映射到原始 response token。
+- `workflow/evaluate_branch_points.py`：生成 Branch Outcome Critic 匿名配对任务，
+  校验 Codex 结果并筛出 Verified Branch Point。
 - `workflow/build_pairs.py`：校验 Codex 选出的 pair 并冻结 Swift DPO 数据。
 - `workflow/prepare_data.py`：汇总历史 chosen，并确定性地维护 Prompt Pool。
 - `workflow/evaluate_test.py`：生成两版 Test Set 回复并汇总 curl1/curl2 结果。
@@ -229,6 +247,8 @@ pair 来源不是封闭白名单，常见的高价值关系包括：
 - `prompt/迭代编排.md`：Codex session 的多轮外层控制 prompt。
 - `prompt/codex/训练对构造.md`：按 prompt 组并行完成事实复核、质量比较和黄金
   pair 构造。
+- `prompt/codex/错误分叉定位.md`：Codex-as-Critic 定位最早语义分叉。
+- `prompt/codex/分叉结果评测.md`：Codex-as-Critic 精评两组分叉回复。
 - `prompt/codex/训练失败诊断.md`：Candidate 未晋级后确定主因和下一次单一改动。
 
 前三个脚本位于 `infra/cli/`；训练 rollout 与重评分脚本位于
@@ -282,7 +302,13 @@ rollout 输入每行是一条待采样对话：
 python infra/inference/rollout.py prompts.jsonl rollouts.jsonl --model /path/to/model
 ```
 
-输出仍以 trace 为一行，`rollouts` 保存每条回复的文本、token IDs、逐 token raw logprob、累计 raw logprob、平均 raw token logprob、token 数和结束原因。采样固定使用 `temperature=1`、`top_p=1`、关闭 top-k 和所有额外 penalty。
+输出仍以 trace 为一行。顶层 `prompt_token_ids` 直接取自 vLLM
+`RequestOutput`，不是事后重新套 chat template；`engine` 保存 vLLM 版本、并行数
+和 raw logprob 模式。`rollouts` 保存每条回复的文本、token IDs、逐 token raw
+logprob、累计 raw logprob、平均 raw token logprob、token 数和结束原因。采样
+固定使用 `temperature=1`、`top_p=1`、关闭 top-k 和所有额外 penalty；seed
+默认为 0，可通过 `--seed` 修改。seed、最大生成长度和完整采样参数都会随结果
+保存，并继续进入 Candidate Packet。
 
 重评分输入直接采用 ms-swift DPO 格式，并额外保留 `trace_id`。chosen 是 `messages` 最后一条 assistant，rejected 位于 `rejected_response`：
 
@@ -303,6 +329,9 @@ python infra/inference/rescore.py pairs.jsonl rescored.jsonl --model /path/to/mo
 ```bash
 python workflow/run_iteration.py rollout runs/iteration-001 prompts.jsonl --model /path/to/model
 python workflow/run_iteration.py select runs/iteration-001 --request-template factuality-request.json
+python workflow/run_iteration.py branch-prepare runs/iteration-001
+python workflow/run_iteration.py branch-rollout runs/iteration-001 codex-locations.jsonl
+python workflow/run_iteration.py branch-evaluate runs/iteration-001 codex-outcomes.jsonl
 python workflow/run_iteration.py freeze runs/iteration-001 codex-draft-pairs.jsonl
 python workflow/run_iteration.py train runs/iteration-001
 python workflow/run_iteration.py evaluate runs/iteration-001 test-set.jsonl test-results.jsonl
@@ -316,8 +345,12 @@ python workflow/run_iteration.py mine runs/iteration-001 badcase-where.sql
 `select` 会把 256 条回复全部送入 `curl.sh`，完整结果写入 `evaluated-rollouts.jsonl`，只把 Supported Tail + pass 16 条、High + fail 8 条、High + pass 8 条写入 `candidate-packets.jsonl`。已有机评结果时可用 `--factuality factuality.jsonl` 重放，格式为：
 
 ```json
-{"trace_id":"trace-1","sample_index":0,"pass":true,"reason":""}
+{"trace_id":"trace-1","sample_index":0,"judge_model":"judge-model-version","judge_input_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pass":true,"reason":""}
 ```
+
+`judge_input_sha256` 绑定规范 JSON `{"messages":...,"response":...}`。脚本会重新
+计算并严格核对，防止只凭 `trace_id + sample_index` 把旧机评套到新回复。同一
+文件中的 `judge_model` 必须是同一个非空版本标识，并会写入门禁来源记录。
 
 历史 chosen 先通过 `infra/inference/rescore.py` 用当前 policy 重评分，再用
 `select --history rescored-history.jsonl` 全量附加。Codex 按
@@ -405,6 +438,91 @@ batch size 1 和两步梯度累积，全局 batch size 为 16；GPU 列表仍可
 `DPO_LEARNING_RATE`、`DPO_BETA`、`DPO_NUM_TRAIN_EPOCHS` 或
 `DPO_RPO_ALPHA`，一次只改一项。full DPO 还需要 reference model，实际能否装下
 取决于单卡显存，启动前必须在目标机器验证。
+
+### 10.6 高概率错误回复的 token 分叉验证
+
+token 分叉验证读取 `candidate-packets.jsonl` 中的 `high_fail` Absolute Reject，
+不构造局部 SFT 或 Preference Pair。它借用 actor–critic 的角色划分：Behavior
+Policy 负责生成，Codex-as-Critic 负责定位和结果判断。这里的 critic 是带项目
+上下文与工具的外部评测者，不是 PPO 的可训练 value model，也不能替换成一次裸
+GPT/API 请求。
+
+流程中有两次 Codex-as-Critic：
+
+1. `locate_branch_points.py prepare` 为每条 `high_fail` 生成一个
+   Branch Localization Critic task。外层 Codex session 按
+   `prompt/codex/错误分叉定位.md` 每条启动一个 subagent。subagent 可以使用搜索、
+   代码和文档工具核实，只返回最早语义分叉的原文字符范围，或明确不可定位。
+2. `locate_branch_points.py finalize` 从原 Candidate Packet 重算 `task_id`，
+   拒绝缺失、重复、额外或过期结果，校验
+   `response[start_char:end_char] == error_span`，再用 Behavior Policy tokenizer
+   和原始 `token_ids` 映射出 Branch Point Candidate。Codex 不提供 token ID。
+3. `branch_rollout.py` 使用首次 rollout 保存的 `prompt_token_ids`，加上
+   `response_token_ids[:pivot_index]`，不重新套 chat template。脚本只排除一次
+   原 token，采样出唯一替代 token，然后生成两组：
+
+   ```text
+   prefix + original_token    + 后缀 × 16
+   prefix + alternative_token + 后缀 × 16
+   ```
+
+   同一个 replica 的两组使用相同续写 seed。原 bad response 不计入原 token 组。
+   如果替代 token 本身直接结束生成，该点不能形成 16 个独立后缀，第一版拒绝这
+   项实验。
+4. `evaluate_branch_points.py prepare` 为每个分叉点生成一个匿名整组 task，不
+   暴露 branch、token 或 critic 理由。一个 task 包含两组各 16 条回复。Branch
+   Outcome Critic 按 `prompt/codex/分叉结果评测.md`，并遵守 `md1`、`md2`，
+   逐条判断事实性和任务完成情况，再比较两组的稳定性与整体质量。一个 task 只能
+   由同一个 Codex subagent 完整处理，不能拆成 16 个两两比较。
+5. `evaluate_branch_points.py finalize` 重算全部 task/response ID，严格校验
+   Codex 结果，再汇总两组的事实性通过率、任务完成率、严格通过率和质量胜负。
+   `overall_pass = factuality_pass && task_pass`。
+
+迭代编排中的标准命令为：
+
+```bash
+python workflow/run_iteration.py branch-prepare runs/iteration-001
+# Codex subagents 处理 branch-localization-tasks.jsonl
+python workflow/run_iteration.py branch-rollout \
+  runs/iteration-001 codex-location-results.jsonl
+# Codex subagents 处理 branch-outcome-tasks.jsonl
+python workflow/run_iteration.py branch-evaluate \
+  runs/iteration-001 codex-outcome-results.jsonl
+```
+
+`task_id` 由脚本根据实际输入和对应 prompt 内容生成，subagent 只负责原样复制。
+finalize 不信任 task 文件或结果文件中的身份字段，而是从原 Candidate Packet 或
+Branch Trial 重新计算。定位结果记录 Codex prompt 与结果文件哈希；结果精评还
+记录 Codex prompt、`md1`、`md2` 和结果文件哈希。
+
+迭代编排固定每组 16 条，`temperature=1`、`top_p=1`、关闭 top-k 和额外 penalty。
+Verified Branch Point 必须同时满足：
+
+- 两组都达到最小试验数；
+- 替代 token 组的 `overall_pass` 率至少为 `0.6`；
+- 替代组相对原 token 组的 `overall_pass` 率至少提高 `0.2`；
+- 替代组事实性通过率不低于原 token 组；
+- 匿名整组比较中，Codex-as-Critic 明确选择替代 token 组。
+
+结果按相同 replica 记录“两边都失败、只替代组通过、只原组通过、两边都通过”。
+16 次只是工程筛选下限，不能写成严格的统计显著性证明。
+
+替代 token 的 `branch_token_raw_logprob` 使用 vLLM `raw_logprobs`，表示排除发生
+前 Behavior Policy 对该 token 的原始 logprob，不是排除原 token 后重新归一化的
+条件概率。
+
+vLLM 公开接口不能复制原 rollout 在 pivot 处的 KV cache。这里验证的是“重新提交
+相同 token prefix 后改变下一个 token”的结果，不能写成恢复原 decoder 状态后
+原地分叉。
+
+`--model` 必须指向不可变的 checkpoint 路径或版本 ID。脚本会校验来源模型和
+分叉模型字符串一致，并保存 vLLM 版本与并行数，但不会为整套模型权重计算哈希；
+不能用会被覆盖的 `latest` 别名冒充可复现实验。
+
+第一版只定位回复中已经出现的局部事实错误，不把“过早停止导致内容缺失”映射成
+EOS 分叉；Branch Localization Critic 对这类回复返回 `localizable=false`。
+Verified Branch Point 只证明这个固定 token 改动在当前采样与 Codex 评测口径下
+实测更有价值；它仍不是 good token、局部 SFT 样本或训练收益证明。
 
 ## 11. 模型晋级规则
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -9,6 +11,39 @@ import sys
 from pathlib import Path
 
 from run_report import write_report
+
+
+BRANCH_ARTIFACTS = (
+    "candidate-packets.jsonl",
+    "branch-localization-tasks.jsonl",
+    "branch-localization-results.jsonl",
+    "branch-candidates.jsonl",
+    "branch-rollouts.jsonl",
+    "branch-outcome-tasks.jsonl",
+    "branch-outcome-results.jsonl",
+    "evaluated-branches.jsonl",
+    "verified-branch-points.jsonl",
+)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_branch_artifacts(
+    directory: Path, branch_validation: dict, expected_names: tuple[str, ...]
+) -> None:
+    artifacts = branch_validation.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(expected_names):
+        raise ValueError("branch artifacts are incomplete")
+    for name in expected_names:
+        path = directory / name
+        if not path.is_file() or artifacts[name] != file_sha256(path):
+            raise ValueError(f"branch artifact missing or changed: {name}")
 
 
 def load_manifest(directory: Path) -> dict:
@@ -23,11 +58,13 @@ def write_manifest(directory: Path, manifest: dict) -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    write_report(directory.parent)
+    try:
+        write_report(directory.parent)
+    except Exception as error:
+        print(f"warning: report update failed: {error}", file=sys.stderr)
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    rows = []
+def iter_jsonl(path: Path):
     with path.open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, 1):
             if not line.strip():
@@ -38,8 +75,15 @@ def read_jsonl(path: Path) -> list[dict]:
                 raise ValueError(f"{path}:{line_number}: invalid JSON") from error
             if not isinstance(row, dict):
                 raise ValueError(f"{path}:{line_number}: expected a JSON object")
-            rows.append(row)
-    return rows
+            yield row
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return list(iter_jsonl(path))
+
+
+def count_jsonl(path: Path) -> int:
+    return sum(1 for _ in iter_jsonl(path))
 
 
 def message_key(messages: object, label: object) -> tuple:
@@ -63,6 +107,7 @@ def main() -> None:
     rollout.add_argument("--model", required=True)
     rollout.add_argument("--tensor-parallel-size", type=int, default=8)
     rollout.add_argument("--max-tokens", type=int, default=8192)
+    rollout.add_argument("--seed", type=int, default=0)
 
     select = stages.add_parser("select")
     select.add_argument("directory", type=Path)
@@ -71,6 +116,23 @@ def main() -> None:
     gate.add_argument("--factuality", type=Path)
     select.add_argument("--history", type=Path)
     select.add_argument("--workers", type=int, default=16)
+
+    branch_prepare = stages.add_parser("branch-prepare")
+    branch_prepare.add_argument("directory", type=Path)
+
+    branch_rollout = stages.add_parser("branch-rollout")
+    branch_rollout.add_argument("directory", type=Path)
+    branch_rollout.add_argument("localization_results", type=Path)
+    branch_rollout.add_argument("--seed", type=int, default=0)
+    branch_rollout.add_argument("--tensor-parallel-size", type=int, default=8)
+    branch_rollout.add_argument("--max-tokens", type=int, default=8192)
+
+    branch_evaluate = stages.add_parser("branch-evaluate")
+    branch_evaluate.add_argument("directory", type=Path)
+    branch_evaluate.add_argument("outcome_results", type=Path)
+    branch_evaluate.add_argument("--min-trials", type=int, default=16)
+    branch_evaluate.add_argument("--min-gain", type=float, default=0.2)
+    branch_evaluate.add_argument("--min-pass-rate", type=float, default=0.6)
 
     freeze = stages.add_parser("freeze")
     freeze.add_argument("directory", type=Path)
@@ -95,6 +157,14 @@ def main() -> None:
 
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    branch_lock = None
+    if args.stage in {"branch-prepare", "branch-rollout", "branch-evaluate"}:
+        branch_lock = (args.directory / ".branch-validation.lock").open("a")
+        try:
+            fcntl.flock(branch_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            branch_lock.close()
+            raise ValueError("branch validation is already running") from error
 
     if args.stage == "rollout":
         args.directory.mkdir(parents=True, exist_ok=False)
@@ -117,6 +187,8 @@ def main() -> None:
                 str(args.tensor_parallel_size),
                 "--max-tokens",
                 str(args.max_tokens),
+                "--seed",
+                str(args.seed),
             ],
             check=True,
         )
@@ -160,9 +232,185 @@ def main() -> None:
         write_manifest(args.directory, manifest)
         return
 
+    if args.stage == "branch-prepare":
+        if manifest.get("status") != "selected" or "branch_validation" in manifest:
+            raise ValueError("branch-prepare requires newly selected candidates")
+        tasks = args.directory / "branch-localization-tasks.jsonl"
+        subprocess.run(
+            [
+                sys.executable,
+                root / "workflow/locate_branch_points.py",
+                "prepare",
+                args.directory / "candidate-packets.jsonl",
+                tasks,
+                "--model",
+                manifest["behavior_policy"],
+            ],
+            check=True,
+        )
+        manifest["branch_validation"] = {
+            "status": "localization_tasks_ready",
+            "localization_tasks": count_jsonl(tasks),
+            "artifacts": {
+                name: file_sha256(args.directory / name)
+                for name in BRANCH_ARTIFACTS[:2]
+            },
+        }
+        write_manifest(args.directory, manifest)
+        branch_lock.close()
+        return
+
+    if args.stage == "branch-rollout":
+        branch_validation = manifest.get("branch_validation")
+        if (
+            manifest.get("status") != "selected"
+            or not isinstance(branch_validation, dict)
+            or branch_validation.get("status") != "localization_tasks_ready"
+        ):
+            raise ValueError("branch-rollout requires localization tasks")
+        validate_branch_artifacts(
+            args.directory, branch_validation, BRANCH_ARTIFACTS[:2]
+        )
+
+        localization_results = args.directory / "branch-localization-results.jsonl"
+        if args.localization_results.resolve() != localization_results.resolve():
+            shutil.copy2(args.localization_results, localization_results)
+        branch_candidates = args.directory / "branch-candidates.jsonl"
+        subprocess.run(
+            [
+                sys.executable,
+                root / "workflow/locate_branch_points.py",
+                "finalize",
+                args.directory / "candidate-packets.jsonl",
+                localization_results,
+                branch_candidates,
+                "--model",
+                manifest["behavior_policy"],
+            ],
+            check=True,
+        )
+
+        branch_rollouts = args.directory / "branch-rollouts.jsonl"
+        subprocess.run(
+            [
+                sys.executable,
+                root / "infra/inference/branch_rollout.py",
+                branch_candidates,
+                branch_rollouts,
+                "--model",
+                manifest["behavior_policy"],
+                "--trials",
+                "16",
+                "--seed",
+                str(args.seed),
+                "--tensor-parallel-size",
+                str(args.tensor_parallel_size),
+                "--max-tokens",
+                str(args.max_tokens),
+            ],
+            check=True,
+        )
+
+        outcome_tasks = args.directory / "branch-outcome-tasks.jsonl"
+        subprocess.run(
+            [
+                sys.executable,
+                root / "workflow/evaluate_branch_points.py",
+                "prepare",
+                branch_rollouts,
+                outcome_tasks,
+            ],
+            check=True,
+        )
+        localized = sum(
+            row.get("critic", {}).get("localizable") is True
+            for row in iter_jsonl(branch_candidates)
+        )
+        branch_validation.update(
+            {
+                "status": "outcome_tasks_ready",
+                "localization_critic": (
+                    "Codex-as-Critic/Branch Localization Critic"
+                ),
+                "localized_branches": localized,
+                "trials_per_token": 16,
+                "outcome_tasks": count_jsonl(outcome_tasks),
+            }
+        )
+        branch_validation["artifacts"].update(
+            {
+                name: file_sha256(args.directory / name)
+                for name in BRANCH_ARTIFACTS[2:6]
+            }
+        )
+        write_manifest(args.directory, manifest)
+        branch_lock.close()
+        return
+
+    if args.stage == "branch-evaluate":
+        branch_validation = manifest.get("branch_validation")
+        if (
+            manifest.get("status") != "selected"
+            or not isinstance(branch_validation, dict)
+            or branch_validation.get("status") != "outcome_tasks_ready"
+        ):
+            raise ValueError("branch-evaluate requires outcome tasks")
+        validate_branch_artifacts(
+            args.directory, branch_validation, BRANCH_ARTIFACTS[:6]
+        )
+
+        outcome_results = args.directory / "branch-outcome-results.jsonl"
+        if args.outcome_results.resolve() != outcome_results.resolve():
+            shutil.copy2(args.outcome_results, outcome_results)
+        evaluated = args.directory / "evaluated-branches.jsonl"
+        verified = args.directory / "verified-branch-points.jsonl"
+        subprocess.run(
+            [
+                sys.executable,
+                root / "workflow/evaluate_branch_points.py",
+                "finalize",
+                args.directory / "branch-rollouts.jsonl",
+                outcome_results,
+                evaluated,
+                verified,
+                "--min-trials",
+                str(args.min_trials),
+                "--min-gain",
+                str(args.min_gain),
+                "--min-pass-rate",
+                str(args.min_pass_rate),
+            ],
+            check=True,
+        )
+        branch_validation.update(
+            {
+                "status": "evaluated",
+                "outcome_critic": "Codex-as-Critic/Branch Outcome Critic",
+                "evaluated_branches": count_jsonl(evaluated),
+                "verified_branches": count_jsonl(verified),
+            }
+        )
+        branch_validation["artifacts"].update(
+            {
+                name: file_sha256(args.directory / name)
+                for name in BRANCH_ARTIFACTS[6:]
+            }
+        )
+        write_manifest(args.directory, manifest)
+        branch_lock.close()
+        return
+
     if args.stage == "freeze":
-        if manifest.get("status") not in {"selected", "freezing"}:
-            raise ValueError("freeze requires selected candidates")
+        branch_validation = manifest.get("branch_validation")
+        if (
+            manifest.get("status") not in {"selected", "freezing"}
+            or not isinstance(branch_validation, dict)
+            or branch_validation.get("status") != "evaluated"
+        ):
+            raise ValueError("freeze requires completed branch validation")
+        validate_branch_artifacts(
+            args.directory, branch_validation, BRANCH_ARTIFACTS
+        )
         manifest["status"] = "freezing"
         write_manifest(args.directory, manifest)
         draft = args.directory / "draft-pairs.jsonl"

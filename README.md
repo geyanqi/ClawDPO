@@ -29,7 +29,10 @@ flowchart TD
     A --> B["Base Model<br/>每个 prompt rollout 256 条"]
     B --> C["全量事实机评、去重和 likelihood 分位裁剪"]
     C --> D["Candidate Packet<br/>筛选后的 rollouts、likelihood、历史 chosen"]
-    D --> E["Codex 并行处理<br/>10 个 subagents，每个处理一个 prompt 组"]
+    D --> BC1["Codex-as-Critic<br/>拉满 subagents 定位分叉点"]
+    BC1 --> BC2["固定原 token 与唯一替代 token<br/>分别续写 16 次"]
+    BC2 --> BC3["Codex-as-Critic<br/>拉满 subagents 精评两组结果"]
+    BC3 --> E["Codex 并行处理<br/>拉满可用 subagents，每个处理一个 prompt 组"]
     E --> F["事实复核、质量比较并构造黄金 DPO pair"]
     F --> G{"存在有效 pair？"}
     G -- "否" --> Z["停止并报告"]
@@ -63,12 +66,17 @@ flowchart TD
 - [迭代编排 prompt](prompt/迭代编排.md)：启动长期 Codex session 时发送的外层循环指令。
 - [Codex 训练对构造](prompt/codex/训练对构造.md)：每个 subagent 只接收一个
   经过机评和 likelihood 边际裁剪的 prompt 组，同时完成事实性复核、质量比较和
-  黄金 pair 构造；每批并行 10 组。
+  黄金 pair 构造；并发方式由外层迭代编排统一控制。
+- [Codex 错误分叉定位](prompt/codex/错误分叉定位.md)：Branch Localization
+  Critic 使用 Codex 的上下文和工具定位最早的语义分叉。
+- [Codex 分叉结果评测](prompt/codex/分叉结果评测.md)：Branch Outcome Critic
+  匿名检查两组回复的事实性、任务完成情况和质量胜负。
 - [Codex 训练失败诊断](prompt/codex/训练失败诊断.md)：Candidate 未晋级时，
   先检查数据，再根据重评分和训练日志判断训练动态，并规定同一 Base 的下一次
   单一改动。
 
-当前状态：单轮工具链已完成；多轮执行由 Codex session 按迭代编排 prompt 持续调用这些入口。
+当前状态：单轮工具链和高概率错误回复的 token 分叉验证链已完成；多轮执行由
+Codex session 按迭代编排 prompt 持续调用这些入口。
 
 ## 启动 Codex session
 
@@ -76,15 +84,18 @@ flowchart TD
 指令，并附上最大轮次、Best Model、Prompt Pool、Test Set、两份机评 request
 template 和 runs 目录即可。
 
-Codex 负责监控、调用命令和筛选 pair；历史汇总、Prompt Pool 转换、Test 机评
-汇总与运行报告由固定脚本完成。临时查看和切片数据时仍可使用 shell 或 `jq`。
-进度持续写入 `<runs_dir>/report.md`。
+Codex 负责监控、调用命令、两次充当分叉 critic 并筛选 pair；历史汇总、Prompt
+Pool 转换、Test 机评汇总与运行报告由固定脚本完成。临时查看和切片数据时仍可
+使用 shell 或 `jq`。进度持续写入 `<runs_dir>/report.md`。
 
 ## 开发入口
 
 ```bash
 python infra/inference/rollout.py --help
 python infra/inference/rescore.py --help
+python infra/inference/branch_rollout.py --help
+python workflow/locate_branch_points.py --help
+python workflow/evaluate_branch_points.py --help
 python workflow/prepare_data.py --help
 python workflow/evaluate_test.py --help
 python workflow/build_diagnosis_packet.py --help
